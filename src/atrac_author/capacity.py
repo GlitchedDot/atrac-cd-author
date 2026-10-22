@@ -8,11 +8,26 @@ Blank sizes in sectors (the app's dropdown set + custom):
 A sector carries 2,048 user bytes. Each track costs payload + exactly
 1,120 B (.ATP overhead law, readout #8) — accounted inside the file
 sizes themselves; on top come the paperwork files and the ISO 9660
-structures, estimated here and then verified exactly post-build.
+structures. The ISO layout is computed exactly (iso.py's planner is
+the same code that writes the image), and the gate additionally
+reserves the space a real burn consumes beyond session 1's ISO —
+a SonicStage disc is left unfinalized with an open, empty session
+2 (see SESSION_OVERHEAD_SECTORS).
 """
 from __future__ import annotations
 
+from . import iso as _iso
+
 SECTOR = 2048
+
+# Sectors a finished burn consumes beyond the session-1 ISO itself,
+# measured on disc 1 (ImgBurn panel + slice image):
+#   150   track post-gap (track length 344,959 - ISO size 344,809)
+#     2   to the session-1 lead-out start (LBA 344,961)
+# 11400   lead-out start -> next writable address 356,361 (the
+#         session-1 lead-out plus session 2's reserved lead-in)
+#   157   closing allowance (blank 360,000 - (356,361 + 3,482 free))
+SESSION_OVERHEAD_SECTORS = 150 + 2 + 11400 + 157
 
 BLANKS = {
     360000: "12 cm 80 min",
@@ -28,46 +43,21 @@ class CapacityError(Exception):
     pass
 
 
-def _path_table_sectors(n_dirs: int, dir_name_lens: list[int]) -> int:
-    size = 10  # root entry
-    for ln in dir_name_lens:
-        size += 8 + 1 + ln + (0 if ln % 2 else 1)
-    import math
-    return 2 * math.ceil(size / SECTOR)  # L + M tables
-
-
 def estimate_iso_sectors(files: dict[str, int]) -> int:
-    """files: ISO path ('/HIFI/TRK00001.ATP') -> size in bytes.
-    Conservative ISO 9660 estimate (pycdlib layout shape)."""
-    import math
-    dirs: dict[str, list[int]] = {}
-    for path, size in files.items():
-        parent = path.rsplit("/", 1)[0] or "/"
-        dirs.setdefault(parent, []).append(size)
-    sectors = 16 + 2  # system area + PVD + terminator
-    sectors += _path_table_sectors(len(dirs), [len(d.rsplit("/", 1)[-1]) for d in dirs if d != "/"])
-    for parent, sizes in dirs.items():
-        # directory data: '.' + '..' + one record per entry (files + subdirs)
-        rec_bytes = 68
-        for path in files:
-            if (path.rsplit("/", 1)[0] or "/") == parent:
-                name = path.rsplit("/", 1)[-1]
-                rec_bytes += 33 + len(name) + (0 if len(name) % 2 else 1)
-        subdirs = [d for d in dirs if d != parent and (d.rsplit("/", 1)[0] or "/") == parent]
-        for sd in subdirs:
-            name = sd.rsplit("/", 1)[-1]
-            rec_bytes += 33 + len(name) + (0 if len(name) % 2 else 1)
-        sectors += max(1, math.ceil(rec_bytes / SECTOR))
-    for size in files.values():
-        sectors += math.ceil(size / SECTOR)
-    return sectors
+    """Exact sector total of the ISO for a {path: size} set — the
+    writer's own layout planner, so the estimate cannot drift from
+    what build_iso will actually emit."""
+    return _iso.iso_sector_count(files)
 
 
 def check_capacity(files: dict[str, int], capacity_sectors: int) -> int:
-    """Returns the estimated sector total; raises CapacityError if over."""
+    """Returns the ISO's exact sector total; raises CapacityError if
+    the ISO plus the burn's session overhead exceeds the blank."""
     est = estimate_iso_sectors(files)
-    if est > capacity_sectors:
+    if est + SESSION_OVERHEAD_SECTORS > capacity_sectors:
         raise CapacityError(
-            f"estimated {est} sectors exceeds blank capacity "
-            f"{capacity_sectors} sectors ({BLANKS.get(capacity_sectors, 'custom')})")
+            f"ISO needs {est} sectors + {SESSION_OVERHEAD_SECTORS} "
+            f"session overhead = {est + SESSION_OVERHEAD_SECTORS}, "
+            f"exceeds blank capacity {capacity_sectors} sectors "
+            f"({BLANKS.get(capacity_sectors, 'custom')})")
     return est

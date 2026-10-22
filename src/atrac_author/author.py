@@ -56,27 +56,32 @@ def build_tree(tracks: list[TrackInput],
 def build_iso(tracks: list[TrackInput], out_path: str,
               capacity_sectors: int = 360000,
               groups: list[tuple[str, int, int]] | None = None,
-              vol_ident: str = "ATRAC_CD",
+              vol_ident: str = "",
               rng: random.Random | None = None) -> dict:
     """Full pipeline with capacity enforcement. Refuses (raising
-    capacity.CapacityError) before writing anything if the estimate is
-    over the blank, and again after the build if the exact ISO size is
-    over. Returns a stats dict."""
+    capacity.CapacityError) before writing anything if the ISO plus
+    the burn's session overhead is over the blank, and again after
+    the build on the exact ISO size. vol_ident defaults to blank —
+    real SonicStage discs carry an all-spaces volume identifier.
+    Returns a stats dict."""
     files = build_tree(tracks, groups=groups, rng=rng)
     sizes = {p: len(d) for p, d in files.items()}
     est_sectors = capacity.check_capacity(sizes, capacity_sectors)
     iso_bytes_written = iso_mod.write_iso(files, out_path, vol_ident)
     exact_sectors = -(-iso_bytes_written // capacity.SECTOR)
-    if exact_sectors > capacity_sectors:
+    if exact_sectors + capacity.SESSION_OVERHEAD_SECTORS > capacity_sectors:
         import os
         os.unlink(out_path)
         raise capacity.CapacityError(
-            f"built ISO is {exact_sectors} sectors > blank {capacity_sectors}; removed")
+            f"built ISO is {exact_sectors} sectors + "
+            f"{capacity.SESSION_OVERHEAD_SECTORS} session overhead > "
+            f"blank {capacity_sectors}; removed")
     return {
         "iso_path": out_path,
         "iso_bytes": iso_bytes_written,
         "iso_sectors": exact_sectors,
         "estimated_sectors": est_sectors,
+        "session_overhead_sectors": capacity.SESSION_OVERHEAD_SECTORS,
         "capacity_sectors": capacity_sectors,
         "capacity_label": capacity.BLANKS.get(capacity_sectors, "custom"),
         "files": {p: (len(d), hashlib.sha256(d).hexdigest())

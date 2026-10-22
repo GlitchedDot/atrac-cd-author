@@ -77,7 +77,7 @@ for path, data in tree.items():
 result = build_iso(tracks, str(OUT / "ladder-demo-PLACEHOLDER-CIPHER.iso"),
                    capacity_sectors=BLANK_80MIN,
                    groups=[("Bitrate Ladder", 1, 9)],
-                   vol_ident="ATRAC_LADDER_DEMO", rng=rng)
+                   vol_ident="", rng=rng)  # blank, like real discs
 
 # 5. Verify the ISO with the independent reader.
 iso_bytes = Path(result["iso_path"]).read_bytes()
