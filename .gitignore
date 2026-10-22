@@ -1,0 +1,7 @@
+__pycache__/
+out/
+work/
+*.iso
+*.bin
+*.cue
+0001000E.STK
