@@ -1,0 +1,1748 @@
+#!/usr/bin/env python3
+"""Unicorn HLE harness for salwrap.dll + OMGUtils.dll (ATRAC SAL dynamic stage).
+
+Loads the two Sony DLLs as real code at their preferred bases, satisfies every
+system-DLL import with a Python implementation behind a stub page, then runs
+DllMain x2 and calls the manager bootstrap FUN_6511D680. An allocation ledger
+records every guest-visible allocation for later memory mining.
+"""
+import os, sys, struct, fnmatch
+import pefile
+from unicorn import *
+from unicorn.x86_const import *
+
+SONY_DIR = '/home/hatch/workspace/atrac-cd-stage0/batch2/Sony Shared/OpenMG'
+REPO_WIN = 'C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG'
+CONTENT_WIN = 'C:\\ProgramData\\SonicStage\\Contents\\'
+HOST_FS = {  # windows path prefix (lower) -> host dir for file IO
+    REPO_WIN.lower(): SONY_DIR,
+    CONTENT_WIN.lower(): '/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/contents',
+    'c:\\': '/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/root',
+}
+os.makedirs(HOST_FS[CONTENT_WIN.lower()], exist_ok=True)
+os.makedirs(HOST_FS['c:\\'], exist_ok=True)
+
+# ---- guest memory map ----
+STUB_BASE   = 0x20000000
+STUB_SIZE   = 0x00010000
+HALT_IDX    = 0
+HEAP_BASE   = 0x10000000
+HEAP_SIZE   = 0x08000000          # 128 MiB
+VA_BASE     = 0x30000000          # VirtualAlloc arena
+VA_SIZE     = 0x10000000
+STACK_BASE  = 0x0E000000
+STACK_SIZE  = 0x01400000
+TEB_BASE    = 0x00000000          # FS base is stuck at 0 in this Unicorn build
+PEB_BASE    = 0x00002000          # (segment loads are refused), so the TEB
+AUX_BASE    = 0x00003000          # lives at linear 0; fs:[x] == linear [x].
+EXE_BASE    = 0x00400000
+OMG_BASE    = 0x63900000
+SAL_BASE    = 0x65100000
+
+TRACE = []
+ALLOC_LEDGER = []
+def log(*a):
+    print(*a, flush=True)
+
+# ---------------------------------------------------------------- allocator
+class Allocator:
+    def __init__(self, uc):
+        self.uc = uc
+        self.brk = HEAP_BASE
+        self.free_list = []       # (addr, size)
+        self.live = {}            # addr -> size
+    def alloc(self, size, tag=''):
+        size = max(16, (size + 15) & ~15)
+        for i, (a, s) in enumerate(self.free_list):
+            if s >= size:
+                if s - size >= 32:
+                    self.free_list[i] = (a + size, s - size)
+                    got = a
+                else:
+                    self.free_list.pop(i); got = a; size = s
+                self.live[got] = size
+                ALLOC_LEDGER.append((got, size, tag))
+                return got
+        got = self.brk
+        self.brk += size
+        if self.brk > HEAP_BASE + HEAP_SIZE:
+            raise RuntimeError('heap exhausted')
+        self.live[got] = size
+        ALLOC_LEDGER.append((got, size, tag))
+        return got
+    def free(self, addr):
+        if addr in self.live:
+            self.free_list.append((addr, self.live.pop(addr)))
+    def realloc(self, addr, size):
+        if addr == 0: return self.alloc(size, 'realloc')
+        old = self.live.get(addr, 0)
+        new = self.alloc(size, 'realloc')
+        n = min(old, size)
+        if n: self.uc.mem_write(new, self.uc.mem_read(addr, n))
+        self.free(addr)
+        return new
+    def size_of(self, addr):
+        return self.live.get(addr, 0)
+
+# ---------------------------------------------------------------- helpers
+class Emu:
+    def __init__(self):
+        self.uc = Uc(UC_ARCH_X86, UC_MODE_32)
+        self.alloc = Allocator(self.uc)
+        self.stubs = []           # (name, handler, conv, nargs) ; idx0 = halt
+        self.stub_by_key = {}
+        self.handles = {}         # guest handle -> ('file', hostfile, path) etc.
+        self.next_handle = 0x100
+        self.last_error = 0
+        self.tls_next = 1
+        self.tls_vals = {}
+        self.tick = 100000
+        self.stop_reason = None
+        self.reg_keys = {}        # handle -> key path
+        self.next_hkey = 0x800
+        self.find_handles = {}
+        self._map_all()
+
+    # memory primitives
+    def rd(self, addr, size):  return bytes(self.uc.mem_read(addr, size))
+    def wr(self, addr, data):  self.uc.mem_write(addr, bytes(data))
+    def r32(self, addr): return struct.unpack('<I', self.rd(addr, 4))[0]
+    def w32(self, addr, v):  self.wr(addr, struct.pack('<I', v & 0xFFFFFFFF))
+    def r16(self, addr): return struct.unpack('<H', self.rd(addr, 2))[0]
+    def cstr(self, addr, maxn=4096):
+        if addr == 0: return ''
+        out = bytearray()
+        while len(out) < maxn:
+            b = self.rd(addr + len(out), 1)[0]
+            if b == 0: break
+            out.append(b)
+        return out.decode('latin-1')
+    def wstr(self, addr, maxn=4096):
+        if addr == 0: return ''
+        out = bytearray()
+        while len(out) < maxn * 2:
+            v = self.r16(addr + len(out))
+            if v == 0: break
+            out += struct.pack('<H', v)
+        return bytes(out).decode('utf-16-le', 'replace')
+    def put_cstr(self, addr, s):
+        self.wr(addr, s.encode('latin-1') + b'\0')
+    def put_wstr(self, addr, s):
+        self.wr(addr, s.encode('utf-16-le') + b'\0\0')
+
+    def _map_all(self):
+        uc = self.uc
+        uc.mem_map(STACK_BASE, STACK_SIZE)
+        uc.mem_map(HEAP_BASE, HEAP_SIZE)
+        uc.mem_map(VA_BASE, VA_SIZE)
+        uc.mem_map(STUB_BASE, STUB_SIZE)
+        uc.mem_write(STUB_BASE, b'\xCC' * STUB_SIZE)
+        uc.mem_map(0x0, 0x10000)                          # TEB/PEB/AUX pages
+        uc.mem_map(EXE_BASE, 0x1000)
+        uc.mem_write(EXE_BASE, b'MZ' + b'\0' * 0x100)
+        # TEB
+        self.w32(TEB_BASE + 0x00, 0xFFFFFFFF)             # SEH chain end
+        self.w32(TEB_BASE + 0x04, STACK_BASE + STACK_SIZE)  # stack base
+        self.w32(TEB_BASE + 0x08, STACK_BASE)               # stack limit
+        self.w32(TEB_BASE + 0x18, TEB_BASE)                 # self
+        self.w32(TEB_BASE + 0x2C, AUX_BASE + 0x6000)        # TLS array ptr
+        # (was AUX_BASE itself: the array aliased the TEB's first bytes,
+        # so guest/HLE TLS writes at slot idx landed on linear idx*4 --
+        # slot 0 overwrote the SEH chain head at fs:[0]. Run 51: the
+        # final dispatch found head=0 after march 3's TLS traffic.)
+        self.w32(TEB_BASE + 0x30, PEB_BASE)                 # PEB
+        # PEB + a plausible RTL_USER_PROCESS_PARAMETERS for CRT startup
+        self.w32(PEB_BASE + 0x08, EXE_BASE)                 # ImageBaseAddress
+        self.w32(PEB_BASE + 0x18, 0x1)                      # ProcessHeap (fake id)
+        PARAMS = AUX_BASE + 0x2000
+        self.w32(PEB_BASE + 0x10, PARAMS)                   # ProcessParameters
+        self.w32(PEB_BASE + 0x0C, AUX_BASE + 0x2C00)        # Ldr (self-linked)
+        ldr = AUX_BASE + 0x2C00
+        self.w32(ldr + 0x0C, ldr + 0x0C); self.w32(ldr + 0x10, ldr + 0x0C)
+        def ustr(at, s, bufat):
+            b = s.encode('utf-16-le')
+            self.wr(bufat, b + b'\0\0')
+            self.wr(at, struct.pack('<HHI', len(b), len(b) + 2, bufat))
+        ustr(PARAMS + 0x38, 'C:\\salhost.exe', AUX_BASE + 0x2400)   # ImagePathName
+        ustr(PARAMS + 0x40, 'salhost.exe', AUX_BASE + 0x2500)       # CommandLine
+        ustr(PARAMS + 0x24, 'C:\\', AUX_BASE + 0x2600)              # CurrentDirectory.DosPath
+        self.w32(PARAMS + 0x48, AUX_BASE + 0x2800)                  # Environment (empty block)
+        # No segment setup: this Unicorn build refuses data-segment loads,
+        # and the default FS base is 0 — which the TEB-at-0 layout exploits.
+        self.va_next = VA_BASE
+
+    # ---------------------------------------------------------- stub engine
+    def make_stub(self, key, name, handler, conv='stdcall', nargs=0):
+        if key in self.stub_by_key:
+            return self.stub_by_key[key]
+        idx = len(self.stubs)
+        self.stubs.append((name, handler, conv, nargs))
+        addr = STUB_BASE + idx * 16
+        self.stub_by_key[key] = addr
+        return addr
+    def halt_stub(self):
+        return self.make_stub('__halt__', '<halt>', None)
+
+    def on_stub(self, addr):
+        idx = (addr - STUB_BASE) // 16
+        name, handler, conv, nargs = self.stubs[idx]
+        uc = self.uc
+        esp = uc.reg_read(UC_X86_REG_ESP)
+        retaddr = self.r32(esp)
+        if idx == HALT_IDX:
+            self.stop_reason = 'halt stub reached'
+            uc.emu_stop(); return
+        if handler is None:
+            self.stop_reason = f'UNIMPLEMENTED import called: {name}'
+            TRACE.append(('UNIMPL', name, retaddr))
+            uc.emu_stop(); return
+        args = [self.r32(esp + 4 + 4 * i) for i in range(12)]
+        TRACE.append(('call', name, args[:max(nargs, 1)]))
+        self._cur_esp = esp; self._cur_retaddr = retaddr
+        try:
+            ret = handler(self, args, uc.reg_read(UC_X86_REG_ECX))
+        except Exception as e:
+            self.stop_reason = f'handler error in {name}: {e!r}'
+            uc.emu_stop(); return
+        if ret is None: ret = 0
+        if isinstance(ret, tuple):                        # (eax, edx)
+            uc.reg_write(UC_X86_REG_EAX, ret[0] & 0xFFFFFFFF)
+            uc.reg_write(UC_X86_REG_EDX, ret[1] & 0xFFFFFFFF)
+        else:
+            uc.reg_write(UC_X86_REG_EAX, ret & 0xFFFFFFFF)
+        clean = 0 if conv == 'cdecl' else 4 * nargs
+        uc.reg_write(UC_X86_REG_ESP, esp + 4 + clean)
+        uc.reg_write(UC_X86_REG_EIP, retaddr)
+
+    # ---------------------------------------------------------- PE loading
+    def load_pe(self, path, base, resolve_imports):
+        pe = pefile.PE(path)
+        uc = self.uc
+        size = (pe.OPTIONAL_HEADER.SizeOfImage + 0xFFF) & ~0xFFF
+        uc.mem_map(base, size)
+        hdr = pe.get_memory_mapped_image()[:pe.OPTIONAL_HEADER.SizeOfHeaders]
+        uc.mem_write(base, bytes(hdr))
+        for sec in pe.sections:
+            raw = sec.get_data()
+            if raw:
+                uc.mem_write(base + sec.VirtualAddress, bytes(raw))
+        # relocations (delta from preferred base; ours is 0 but stay correct)
+        delta = base - pe.OPTIONAL_HEADER.ImageBase
+        if delta != 0 and hasattr(pe, 'DIRECTORY_ENTRY_BASERELOC'):
+            for entry in pe.DIRECTORY_ENTRY_BASERELOC:
+                for r in entry.entries:
+                    if r.type == 3:  # HIGHLOW
+                        a = base + r.rva
+                        self.w32(a, (self.r32(a) + delta) & 0xFFFFFFFF)
+        exports = {}
+        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            for s in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if s.name:
+                    exports[s.name.decode()] = base + s.address
+                if s.ordinal:
+                    exports[f'#{s.ordinal}'] = base + s.address
+        if resolve_imports:
+            for desc in pe.DIRECTORY_ENTRY_IMPORT:
+                dll = desc.dll.decode().lower()
+                for imp in desc.imports:
+                    nm = imp.name.decode() if imp.name else f'#{imp.ordinal}'
+                    self.resolve_one(base, imp.address, dll, nm)
+        return exports
+
+    def resolve_one(self, mod_base, iat_addr, dll, nm):
+        key = f'{dll}!{nm}'
+        # real cross-module exports win (OMGUtils for salwrap)
+        if key in EXPORTS or nm in EXPORTS:
+            self.w32(iat_addr, EXPORTS.get(key, EXPORTS.get(nm))); return
+        if key in DATA_IMPORTS:
+            cell = self.alloc.alloc(16, f'data:{key}')
+            self.wr(cell, DATA_IMPORTS[key])
+            self.w32(iat_addr, cell); return
+        spec = HLE.get(key) or HLE.get(nm)
+        if spec is not None:
+            handler, conv, nargs = spec
+            self.w32(iat_addr, self.make_stub(key, key, handler, conv, nargs))
+        else:
+            self.w32(iat_addr, self.make_stub(key, key, None))
+
+    # --------------------------------------------------- SEH support pieces
+    def snapshot_ctx(self, ctx, eip, esp):
+        uc = self.uc
+        self.wr(ctx, b'\0' * 716)
+        self.w32(ctx + 0x00, 0x10017)                     # ContextFlags: full+debug
+        dr = getattr(self, 'dr', [0] * 8)
+        for i, off in enumerate((0x04, 0x08, 0x0C, 0x10, 0x14, 0x18)):
+            self.w32(ctx + off, (dr[0], dr[1], dr[2], dr[3], dr[6], dr[7])[i])
+        # TRUE x86 CONTEXT layout: segs 0x8C.., Edi 0x9C, Esi 0xA0, Ebx 0xA4,
+        # Edx 0xA8, Ecx 0xAC, Eax 0xB0, Ebp 0xB4, Eip 0xB8, SegCs 0xBC,
+        # EFlags 0xC0, Esp 0xC4, SegSs 0xC8.
+        w = lambda off, v: self.w32(ctx + off, v)
+        w(0x8C, 0x2B); w(0x90, 0x53); w(0x94, 0x2B); w(0x98, 0x2B)
+        w(0x9C, uc.reg_read(UC_X86_REG_EDI)); w(0xA0, uc.reg_read(UC_X86_REG_ESI))
+        w(0xA4, uc.reg_read(UC_X86_REG_EBX)); w(0xA8, uc.reg_read(UC_X86_REG_EDX))
+        w(0xAC, uc.reg_read(UC_X86_REG_ECX)); w(0xB0, uc.reg_read(UC_X86_REG_EAX))
+        w(0xB4, uc.reg_read(UC_X86_REG_EBP)); w(0xB8, eip); w(0xBC, 0x23)
+        w(0xC0, uc.reg_read(UC_X86_REG_EFLAGS)); w(0xC4, esp); w(0xC8, 0x2B)
+    def apply_ctx(self, ctx):
+        uc = self.uc
+        g = lambda off: self.r32(ctx + off)
+        uc.reg_write(UC_X86_REG_EDI, g(0x9C)); uc.reg_write(UC_X86_REG_ESI, g(0xA0))
+        uc.reg_write(UC_X86_REG_EBX, g(0xA4)); uc.reg_write(UC_X86_REG_EDX, g(0xA8))
+        uc.reg_write(UC_X86_REG_ECX, g(0xAC)); uc.reg_write(UC_X86_REG_EAX, g(0xB0))
+        uc.reg_write(UC_X86_REG_EBP, g(0xB4))
+        uc.reg_write(UC_X86_REG_EFLAGS, g(0xC0) | 2)
+        uc.reg_write(UC_X86_REG_ESP, g(0xC4))
+        return g(0xB8)
+    def raw_call(self, fn, args, label='seh'):
+        """Call fn(args...) at the CURRENT stack position (for SEH handlers)."""
+        uc = self.uc
+        esp = uc.reg_read(UC_X86_REG_ESP) - 0x40
+        halt = self.halt_stub()
+        try:
+            self.w32(esp, halt)
+            for i, a in enumerate(args):
+                self.w32(esp + 4 + 4 * i, a)
+        except UcError:
+            # Faulting ESP is wild/unmapped (e.g. the fault WAS a stack
+            # push past the edge). The OS guarantees the dispatcher a
+            # runnable stack; emulate that with a scratch stack in AUX.
+            esp = 0xDFF0
+            self.w32(esp, halt)
+            for i, a in enumerate(args):
+                self.w32(esp + 4 + 4 * i, a)
+        uc.reg_write(UC_X86_REG_ESP, esp)
+        # The OS delivers exceptions with TF clear in the handler's live
+        # flags (TF survives only inside the saved CONTEXT). Without this,
+        # a guest-set trap flag single-steps the handler itself to death.
+        uc.reg_write(UC_X86_REG_EFLAGS, uc.reg_read(UC_X86_REG_EFLAGS) & ~0x100)
+        self.stop_reason = None
+        try:
+            uc.emu_start(fn, halt, count=0)
+        except UcError as ex:
+            self.stop_reason = (f'UcError {ex} during {label} at '
+                                f'EIP={uc.reg_read(UC_X86_REG_EIP):#x}')
+        return uc.reg_read(UC_X86_REG_EAX)
+
+    # ---------------------------------------------------------- execution
+    def call(self, addr, args=(), ecx=None, label=''):
+        uc = self.uc
+        esp = STACK_BASE + STACK_SIZE - 0x1000
+        for i, a in enumerate(args):
+            self.w32(esp + 4 + 4 * i, a)
+        halt = self.halt_stub()
+        self.w32(esp, halt)
+        uc.reg_write(UC_X86_REG_ESP, esp)
+        if ecx is not None:
+            uc.reg_write(UC_X86_REG_ECX, ecx)
+        self.stop_reason = None
+        try:
+            uc.emu_start(addr, halt, count=0)
+        except UcError as e:
+            self.stop_reason = f'UcError {e} during {label}'
+        eax = uc.reg_read(UC_X86_REG_EAX)
+        if self.stop_reason:
+            log(f'  [{label}] stopped: {self.stop_reason}')
+        return eax
+
+EXPORTS = {}
+DATA_IMPORTS = {
+    'msvcp71.dll!?npos@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@2IB':
+        struct.pack('<I', 0xFFFFFFFF),
+    'msvcp71.dll!?npos@?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@2IB':
+        struct.pack('<I', 0xFFFFFFFF),
+}
+HLE = {}   # filled by hle tables below (key 'dll!name' or bare 'name' -> (fn, conv, nargs))
+
+# ================================================================ CRT (HLE)
+def _fmt(e, fmt, args, wide=False):
+    """Minimal printf formatter. args = list of stack slots (ints)."""
+    out = []
+    ai = 0
+    i = 0
+    while i < len(fmt):
+        c = fmt[i]
+        if c != '%':
+            out.append(c); i += 1; continue
+        i += 1
+        if i < len(fmt) and fmt[i] == '%':
+            out.append('%'); i += 1; continue
+        flags = ''
+        while i < len(fmt) and fmt[i] in '-+ #0':
+            flags += fmt[i]; i += 1
+        width = ''
+        while i < len(fmt) and fmt[i].isdigit():
+            width += fmt[i]; i += 1
+        prec = None
+        if i < len(fmt) and fmt[i] == '.':
+            i += 1; prec = ''
+            while i < len(fmt) and fmt[i].isdigit():
+                prec += fmt[i]; i += 1
+        lng = ''
+        while i < len(fmt) and fmt[i] in 'lhI':
+            lng += fmt[i]; i += 1
+        if i >= len(fmt): break
+        conv = fmt[i]; i += 1
+        a = args[ai] if ai < len(args) else 0
+        if conv in 'di':
+            v = a - (1 << 32) if a >= (1 << 31) else a
+            s = str(v); ai += 1
+        elif conv == 'u':
+            s = str(a); ai += 1
+        elif conv in 'xX':
+            s = format(a, 'x' if conv == 'x' else 'X'); ai += 1
+            if '#' in flags: s = '0x' + s
+        elif conv == 'o':
+            s = format(a, 'o'); ai += 1
+        elif conv == 'p':
+            s = format(a, '08X'); ai += 1
+        elif conv == 'c':
+            s = chr(a & 0xFF); ai += 1
+        elif conv == 's':
+            s = e.wstr(a) if (wide or 'l' in lng or 'w' in lng) else e.cstr(a)
+            ai += 1
+            if prec not in (None, ''): s = s[:int(prec)]
+        elif conv in 'feEgG':
+            # float args live on the stack as doubles (8 bytes, 2 slots)
+            lo = a; hi = args[ai + 1] if ai + 1 < len(args) else 0
+            v = struct.unpack('<d', struct.pack('<II', lo, hi))[0]
+            s = ('%g' % v) if conv in 'gG' else ('%f' % v)
+            ai += 2
+        else:
+            s = '%' + conv
+        w = int(width) if width else 0
+        if len(s) < w:
+            pad = '0' if ('0' in flags and '-' not in flags and conv in 'diuxXop') else ' '
+            s = (s + pad * (w - len(s))) if '-' in flags else (pad * (w - len(s)) + s)
+        out.append(s)
+    return ''.join(out)
+
+def h_malloc(e, a, x):   return e.alloc.alloc(a[0], 'malloc')
+def h_calloc(e, a, x):   
+    p = e.alloc.alloc(a[0] * a[1], 'calloc'); e.wr(p, b'\0' * (a[0] * a[1])); return p
+def h_realloc(e, a, x):  return e.alloc.realloc(a[0], a[1])
+def h_free(e, a, x):     e.alloc.free(a[0]); return 0
+def h_new(e, a, x):      return e.alloc.alloc(a[0], 'operator new')
+def h_memcpy(e, a, x):
+    if a[2]: e.wr(a[0], e.rd(a[1], a[2]))
+    return a[0]
+def h_memset(e, a, x):
+    if a[2]: e.wr(a[0], bytes([a[1] & 0xFF]) * a[2])
+    return a[0]
+def h_memcmp(e, a, x):
+    b1, b2 = e.rd(a[0], a[2]), e.rd(a[1], a[2])
+    return 0 if b1 == b2 else (1 if b1 > b2 else -1)
+def h_memchr(e, a, x):
+    buf = e.rd(a[0], a[2])
+    i = buf.find(bytes([a[1] & 0xFF]))
+    return a[0] + i if i >= 0 else 0
+def h_strlen(e, a, x):   return len(e.cstr(a[0]))
+def h_strcpy(e, a, x):
+    s = e.cstr(a[1]); e.put_cstr(a[0], s); return a[0]
+def h_strncpy(e, a, x):
+    s = e.cstr(a[1])[:a[2]]; e.wr(a[0], s.encode('latin-1') + b'\0' * (a[2] - len(s))); return a[0]
+def h_strcat(e, a, x):
+    d = e.cstr(a[0]); s = e.cstr(a[1]); e.put_cstr(a[0], d + s); return a[0]
+def h_strcmp(e, a, x):
+    s1, s2 = e.cstr(a[0]), e.cstr(a[1])
+    return 0 if s1 == s2 else (1 if s1 > s2 else -1)
+def h_strncmp(e, a, x):
+    s1, s2 = e.cstr(a[0])[:a[2]], e.cstr(a[1])[:a[2]]
+    return 0 if s1 == s2 else (1 if s1 > s2 else -1)
+def h_stricmp(e, a, x):
+    s1, s2 = e.cstr(a[0]).lower(), e.cstr(a[1]).lower()
+    return 0 if s1 == s2 else (1 if s1 > s2 else -1)
+def h_strchr(e, a, x):
+    s = e.cstr(a[0]); i = s.find(chr(a[1] & 0xFF))
+    return a[0] + i if i >= 0 else 0
+def h_strrchr(e, a, x):
+    s = e.cstr(a[0]); i = s.rfind(chr(a[1] & 0xFF))
+    return a[0] + i if i >= 0 else 0
+def h_strstr(e, a, x):
+    s, n = e.cstr(a[0]), e.cstr(a[1]); i = s.find(n)
+    return a[0] + i if i >= 0 else 0
+def h_strdup(e, a, x):
+    s = e.cstr(a[0]); p = e.alloc.alloc(len(s) + 1, 'strdup'); e.put_cstr(p, s); return p
+def h_sprintf(e, a, x):
+    s = _fmt(e, e.cstr(a[1]), a[2:]); e.put_cstr(a[0], s); return len(s)
+def h_snprintf(e, a, x):
+    s = _fmt(e, e.cstr(a[2]), a[3:])
+    if a[1]: e.wr(a[0], s[:a[1] - 1].encode('latin-1') + b'\0')
+    return len(s)
+def h_vsprintf(e, a, x):
+    # va_list == pointer to arg array in guest memory
+    va = a[2]; args = [e.r32(va + 4 * i) for i in range(10)]
+    s = _fmt(e, e.cstr(a[1]), args); e.put_cstr(a[0], s); return len(s)
+def h_vsnprintf(e, a, x):
+    va = a[3]; args = [e.r32(va + 4 * i) for i in range(10)]
+    s = _fmt(e, e.cstr(a[2]), args)
+    if a[1]: e.wr(a[0], s[:a[1] - 1].encode('latin-1') + b'\0')
+    return len(s)
+def h_printf(e, a, x):
+    s = _fmt(e, e.cstr(a[0]), a[1:]); log('  [guest printf]', s); return len(s)
+def h_fprintf(e, a, x):
+    s = _fmt(e, e.cstr(a[1]), a[2:]); log('  [guest fprintf]', s); return len(s)
+def h_noop0(e, a, x):    return 0
+def h_ret1(e, a, x):     return 1
+def h_atoi(e, a, x):
+    try: return int(e.cstr(a[0]).strip() or 0)
+    except ValueError: return 0
+def h_atol(e, a, x):     return h_atoi(e, a, x)
+def h_strtol(e, a, x):
+    s = e.cstr(a[0]).lstrip()
+    try: v = int(s.split()[0], a[2] if a[2] else 10)
+    except Exception: v = 0
+    return v
+def h_tolower(e, a, x):  return ord(chr(a[0] & 0xFF).lower())
+def h_toupper(e, a, x):  return ord(chr(a[0] & 0xFF).upper())
+def h_abs(e, a, x):
+    v = a[0] - (1 << 32) if a[0] >= (1 << 31) else a[0]
+    return abs(v)
+def h_time(e, a, x):
+    import time as _t
+    v = int(_t.time())
+    if a[0]: e.w32(a[0], v)
+    return v
+def h_clock(e, a, x):
+    e.tick += 1000; return e.tick
+def h_qsort(e, a, x):
+    log('  [hle] qsort: left unsorted (comparator is guest code)')
+    return 0
+def h_abort(e, a, x):
+    raise RuntimeError('guest called abort/exit')
+INITQ = []
+def h_initterm(e, a, x):
+    # Handlers cannot call guest code mid-hook; queue the table and let the
+    # runner drain it between top-level calls (DllMain returns fine without
+    # the ctors having run yet; the users of the statics come later).
+    INITQ.append((a[0], a[1]))
+    log(f'  [hle] _initterm({a[0]:#x},{a[1]:#x}) queued')
+    return 0
+def h_ftol(e, a, x):
+    raw = e.uc.reg_read(UC_X86_REG_ST0)
+    if isinstance(raw, int):
+        return raw & 0xFFFFFFFF
+    b = raw if isinstance(raw, bytes) else bytes(raw)
+    try:
+        import numpy as _np
+        v = float(_np.frombuffer(b[:10], dtype=_np.float80)[0])
+    except Exception:
+        v = 0.0
+    return int(v) & 0xFFFFFFFF
+
+CRT = {
+ 'malloc': (h_malloc, 'cdecl', 1), 'calloc': (h_calloc, 'cdecl', 2),
+ 'realloc': (h_realloc, 'cdecl', 2), 'free': (h_free, 'cdecl', 1),
+ '_malloc': (h_malloc, 'cdecl', 1), '_free': (h_free, 'cdecl', 1),
+ 'memcpy': (h_memcpy, 'cdecl', 3), 'memmove': (h_memcpy, 'cdecl', 3),
+ 'memset': (h_memset, 'cdecl', 3), 'memcmp': (h_memcmp, 'cdecl', 3),
+ 'memchr': (h_memchr, 'cdecl', 3),
+ 'strlen': (h_strlen, 'cdecl', 1), 'strcpy': (h_strcpy, 'cdecl', 2),
+ 'strncpy': (h_strncpy, 'cdecl', 3), 'strcat': (h_strcat, 'cdecl', 2),
+ 'strncat': (h_strcat, 'cdecl', 3), 'strcmp': (h_strcmp, 'cdecl', 2),
+ 'strncmp': (h_strncmp, 'cdecl', 3), '_stricmp': (h_stricmp, 'cdecl', 2),
+ '_strcmpi': (h_stricmp, 'cdecl', 2), 'stricmp': (h_stricmp, 'cdecl', 2),
+ 'strchr': (h_strchr, 'cdecl', 2), 'strrchr': (h_strrchr, 'cdecl', 2),
+ 'strstr': (h_strstr, 'cdecl', 2), '_strdup': (h_strdup, 'cdecl', 1),
+ 'strdup': (h_strdup, 'cdecl', 1),
+ 'sprintf': (h_sprintf, 'cdecl', 2), '_snprintf': (h_snprintf, 'cdecl', 3),
+ 'snprintf': (h_snprintf, 'cdecl', 3),
+ 'vsprintf': (h_vsprintf, 'cdecl', 3), '_vsnprintf': (h_vsnprintf, 'cdecl', 4),
+ 'vsnprintf': (h_vsnprintf, 'cdecl', 4),
+ 'printf': (h_printf, 'cdecl', 1), 'fprintf': (h_fprintf, 'cdecl', 2),
+ 'atoi': (h_atoi, 'cdecl', 1), 'atol': (h_atol, 'cdecl', 1),
+ 'strtol': (h_strtol, 'cdecl', 3), 'strtoul': (h_strtol, 'cdecl', 3),
+ 'tolower': (h_tolower, 'cdecl', 1), 'toupper': (h_toupper, 'cdecl', 1),
+ 'abs': (h_abs, 'cdecl', 1), 'labs': (h_abs, 'cdecl', 1),
+ 'time': (h_time, 'cdecl', 1), 'clock': (h_clock, 'cdecl', 0),
+ 'qsort': (h_qsort, 'cdecl', 4),
+ 'abort': (h_abort, 'cdecl', 0), 'exit': (h_abort, 'cdecl', 1),
+ '_initterm': (h_initterm, 'cdecl', 2), '_initterm_e': (h_initterm, 'cdecl', 2),
+ 'atexit': (h_noop0, 'cdecl', 1), '_onexit': (h_noop0, 'cdecl', 1),
+ '__dllonexit': (h_noop0, 'cdecl', 3),
+ '_except_handler3': (h_ret1, 'cdecl', 4), '__CxxFrameHandler': (h_ret1, 'cdecl', 4),
+ '_except_handler4': (h_ret1, 'cdecl', 5),
+ '_CxxThrowException': (h_abort, 'cdecl', 2),
+ '_ftol': (h_ftol, 'cdecl', 0),
+ '??2@YAPAXI@Z': (h_new, 'cdecl', 1),                       # operator new
+ '??3@YAXPAX@Z': (h_free, 'cdecl', 1),                      # operator delete
+ '??_U@YAPAXI@Z': (h_new, 'cdecl', 1),                      # operator new[]
+ '??_V@YAXPAX@Z': (h_free, 'cdecl', 1),                     # operator delete[]
+ '_encoded_null': (h_noop0, 'cdecl', 0),
+}
+HLE.update(CRT)
+
+# ===================================================== MSVC71 std::string
+# layout (proven from OMGUtils inline code): +0 alloc, +4 _Bx(_Ptr|_Buf[16B]),
+# +0x14 _Mysize, +0x18 _Myres ; SSO iff _Myres < 16/elemcap-units
+def _sso(e, o, elem):   return e.r32(o + 0x18) < (16 // elem)
+def _sbuf(e, o, elem):  return e.r32(o + 4) if not _sso(e, o, elem) else o + 4
+def _sdata(e, o, elem):
+    n = e.r32(o + 0x14)
+    raw = e.rd(_sbuf(e, o, elem), n * elem)
+    return raw.decode('utf-16-le' if elem == 2 else 'latin-1')
+def _sset(e, o, s, elem):
+    enc = s.encode('utf-16-le' if elem == 2 else 'latin-1')
+    n = len(enc) // elem
+    cap = (16 // elem) - 1
+    res = e.r32(o + 0x18)
+    if n > res:
+        newres = max(n, res + res // 2, cap)
+        nb = e.alloc.alloc((newres + 1) * elem, 'std::string buf')
+        if not _sso(e, o, elem): e.alloc.free(e.r32(o + 4))
+        e.w32(o + 4, nb); e.w32(o + 0x18, newres)
+    buf = _sbuf(e, o, elem)
+    e.wr(buf, enc); e.wr(buf + n * elem, b'\0' * elem)
+    e.w32(o + 0x14, n)
+def _sappend(e, o, s, elem):
+    _sset(e, o, _sdata(e, o, elem) + s, elem)
+def _sinit(e, o, elem):
+    e.w32(o + 0x00, 0); e.w32(o + 0x14, 0)
+    e.w32(o + 0x18, (16 // elem) - 1); e.wr(o + 4, b'\0' * elem)
+
+def mk_str_handlers(elem):
+    rd = (lambda e, a: e.wstr(a)) if elem == 2 else (lambda e, a: e.cstr(a))
+    def ctor_cstr(e, a, x):   _sinit(e, x, elem); _sset(e, x, rd(e, a[0]) if a[0] else '', elem); return x
+    def ctor_copy(e, a, x):   _sinit(e, x, elem); _sset(e, x, _sdata(e, a[0], elem), elem); return x
+    def ctor_def(e, a, x):    _sinit(e, x, elem); return x
+    def dtor(e, a, x):
+        if not _sso(e, x, elem): e.alloc.free(e.r32(x + 4))
+        e.w32(x + 0x14, 0); e.w32(x + 0x18, 0); return 0
+    def assign_str(e, a, x):  _sset(e, x, _sdata(e, a[0], elem), elem); return x
+    def assign_cstr(e, a, x): _sset(e, x, rd(e, a[0]) if a[0] else '', elem); return x
+    def assign_n(e, a, x):    _sset(e, x, rd(e, a[0])[:a[1]] if a[0] else '', elem); return x
+    def append_cstr(e, a, x): _sappend(e, x, rd(e, a[0]) if a[0] else '', elem); return x
+    def append_str(e, a, x):  _sappend(e, x, _sdata(e, a[0], elem), elem); return x
+    def c_str(e, a, x):       return _sbuf(e, x, elem)
+    def erase(e, a, x):
+        s = _sdata(e, x, elem); off, cnt = a[0], a[1]
+        if off <= len(s):
+            cnt = len(s) - off if cnt >= len(s) else cnt
+            _sset(e, x, s[:off] + s[off + cnt:], elem)
+        return x
+    def find_ch(e, a, x):
+        s = _sdata(e, x, elem); ch = chr(a[0] & (0xFFFF if elem == 2 else 0xFF))
+        i = s.find(ch, a[1]); return i if i >= 0 else 0xFFFFFFFF
+    def find_last_of(e, a, x):
+        s = _sdata(e, x, elem); chars = rd(e, a[0]); off = a[1]
+        off = min(off, len(s) - 1) if s else 0
+        for i in range(off, -1, -1):
+            if s[i] in chars: return i
+        return 0xFFFFFFFF
+    def substr(e, a, x):
+        s = _sdata(e, x, elem)
+        _sinit(e, a[0], elem); _sset(e, a[0], s[a[1]:a[1] + a[2]], elem)
+        return a[0]
+    return dict(ctor_cstr=ctor_cstr, ctor_copy=ctor_copy, ctor_def=ctor_def,
+                dtor=dtor, assign_str=assign_str, assign_cstr=assign_cstr,
+                assign_n=assign_n, append_cstr=append_cstr, append_str=append_str,
+                c_str=c_str, erase=erase, find_ch=find_ch,
+                find_last_of=find_last_of, substr=substr)
+
+def _throw(e, a, x):
+    raise RuntimeError('std::_Xlen/_Xran/_Nomemory called (string throw)')
+
+for elem, E in ((1, 'D'), (2, 'G')):
+    H = mk_str_handlers(elem)
+    T = f'?$basic_string@{E}U?$char_traits@{E}@std@@V?$allocator@{E}@2@@std@@'
+    HLE[f'??0{T}QAE@PB{E}@Z'] = (H['ctor_cstr'], 'thiscall', 1)
+    HLE[f'??0{T}QAE@ABV01@@Z'] = (H['ctor_copy'], 'thiscall', 1)
+    HLE[f'??0{T}QAE@XZ'] = (H['ctor_def'], 'thiscall', 0)
+    HLE[f'??1{T}QAE@XZ'] = (H['dtor'], 'thiscall', 0)
+    HLE[f'??4{T}QAEAAV01@ABV01@@Z'] = (H['assign_str'], 'thiscall', 1)
+    HLE[f'??4{T}QAEAAV01@PB{E}@Z'] = (H['assign_cstr'], 'thiscall', 1)
+    HLE[f'?assign@{T}QAEAAV12@PB{E}I@Z'] = (H['assign_n'], 'thiscall', 2)
+    HLE[f'??Y{T}QAEAAV01@PB{E}@Z'] = (H['append_cstr'], 'thiscall', 1)
+    HLE[f'??Y{T}QAEAAV01@ABV01@@Z'] = (H['append_str'], 'thiscall', 1)
+    HLE[f'?c_str@{T}QBEPB{E}XZ'] = (H['c_str'], 'thiscall', 0)
+    HLE[f'?erase@{T}QAEAAV12@II@Z'] = (H['erase'], 'thiscall', 2)
+    HLE[f'?find@{T}QBEI{E}I@Z'] = (H['find_ch'], 'thiscall', 2)
+    HLE[f'?find_last_of@{T}QBEIPB{E}I@Z'] = (H['find_last_of'], 'thiscall', 2)
+    HLE[f'?substr@{T}QBE?AV12@II@Z'] = (H['substr'], 'thiscall', 3)
+HLE['?_Xlen@_String_base@std@@QBEXXZ'] = (_throw, 'thiscall', 0)
+HLE['?_Xran@_String_base@std@@QBEXXZ'] = (_throw, 'thiscall', 0)
+HLE['?_Nomemory@std@@YAXXZ'] = (_throw, 'cdecl', 0)
+def _op_lt(e, a, x):
+    s1 = _sdata(e, a[0], 1); s2 = _sdata(e, a[1], 1)
+    return 1 if s1 < s2 else 0
+HLE['??$?MDU?$char_traits@D@std@@V?$allocator@D@1@@std@@YA_NABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@0@0@Z'] = (_op_lt, 'cdecl', 2)
+
+# ================================================================ Win32 HLE
+import os as _os
+def host_path(win):
+    w = win.replace('/', '\\')
+    lw = w.lower()
+    for pre, host in sorted(HOST_FS.items(), key=lambda kv: -len(kv[0])):
+        if lw.startswith(pre):
+            rest = w[len(pre):].replace('\\', '/')
+            return _os.path.join(host, rest)
+    return None
+
+def h_CreateFileA(e, a, x):
+    path = e.cstr(a[0]); hp = host_path(path)
+    if hp is None:
+        e.last_error = 3; return 0xFFFFFFFF
+    access, disp = a[1], a[4]
+    write = bool(access & 0xC0000000)
+    try:
+        if disp == 2 or (disp in (1, 4) and not _os.path.exists(hp)):  # CREATE_ALWAYS/NEW/OPEN_ALWAYS-new
+            fh = open(hp, 'w+b')
+        elif write:
+            fh = open(hp, 'r+b') if _os.path.exists(hp) else open(hp, 'w+b')
+        else:
+            fh = open(hp, 'rb')
+    except OSError:
+        e.last_error = 2; return 0xFFFFFFFF
+    h = e.next_handle; e.next_handle += 4
+    e.handles[h] = ('file', fh, path)
+    return h
+def h_CreateFileW(e, a, x):
+    class A: pass
+    w = e.wstr(a[0])
+    p = e.alloc.alloc(len(w) + 1, 'tmp path'); e.put_cstr(p, w)
+    return h_CreateFileA(e, [p, a[1], a[2], a[3], a[4], a[5], a[6]], x)
+def h_ReadFile(e, a, x):
+    ent = e.handles.get(a[0])
+    if not ent or ent[0] != 'file': e.last_error = 6; return 0
+    data = ent[1].read(a[2])
+    if data: e.wr(a[1], data)
+    if a[3]: e.w32(a[3], len(data))
+    return 1
+def h_WriteFile(e, a, x):
+    ent = e.handles.get(a[0])
+    if ent and ent[0] == 'file':
+        data = e.rd(a[1], a[2]); ent[1].write(data); ent[1].flush()
+        if a[3]: e.w32(a[3], len(data))
+        return 1
+    if a[0] in (0xFFFFFFF5, 0xFFFFFFF6, 0xFFFFFFF4):  # std handles -> host log
+        log('  [guest write]', e.rd(a[1], a[2])[:200])
+        if a[3]: e.w32(a[3], a[2])
+        return 1
+    e.last_error = 6; return 0
+def h_GetFileSize(e, a, x):
+    ent = e.handles.get(a[0])
+    if not ent or ent[0] != 'file': return 0xFFFFFFFF
+    pos = ent[1].tell(); ent[1].seek(0, 2); sz = ent[1].tell(); ent[1].seek(pos)
+    if a[1]: e.w32(a[1], 0)
+    return sz
+def h_SetFilePointer(e, a, x):
+    ent = e.handles.get(a[0])
+    if not ent or ent[0] != 'file': return 0xFFFFFFFF
+    dist = a[1] - (1 << 32) if a[1] >= (1 << 31) else a[1]
+    ent[1].seek(dist, a[3])
+    return ent[1].tell()
+def h_CloseHandle(e, a, x):
+    ent = e.handles.pop(a[0], None)
+    if ent and ent[0] == 'file':
+        try: ent[1].close()
+        except Exception: pass
+    if ent and ent[0] == 'find' and 'fh' in ent[1]:
+        pass
+    return 1
+def h_GetFileAttributesA(e, a, x):
+    hp = host_path(e.cstr(a[0]))
+    if hp is None or not _os.path.exists(hp):
+        e.last_error = 2; return 0xFFFFFFFF
+    return 0x10 if _os.path.isdir(hp) else 0x80
+def _fill_find(e, addr, hp):
+    st = _os.stat(hp)
+    e.w32(addr + 0, 0x10 if _os.path.isdir(hp) else 0x80)
+    e.w32(addr + 36, 0); e.w32(addr + 40, st.st_size & 0xFFFFFFFF)
+    e.put_cstr(addr + 52, _os.path.basename(hp))
+    e.put_cstr(addr + 312, '')
+def h_FindFirstFileA(e, a, x):
+    pat = e.cstr(a[0]); hp = host_path(pat)
+    if hp is None: return 0xFFFFFFFF
+    d = _os.path.dirname(hp); base = _os.path.basename(hp)
+    try: names = sorted(n for n in _os.listdir(d) if fnmatch.fnmatch(n.lower(), base.lower()))
+    except OSError: return 0xFFFFFFFF
+    if not names: e.last_error = 2; return 0xFFFFFFFF
+    h = e.next_handle; e.next_handle += 4
+    e.handles[h] = ('find', {'dir': d, 'names': names, 'i': 0})
+    _fill_find(e, a[1], _os.path.join(d, names[0]))
+    return h
+def h_FindNextFileA(e, a, x):
+    ent = e.handles.get(a[0])
+    if not ent or ent[0] != 'find': return 0
+    st = ent[1]; st['i'] += 1
+    if st['i'] >= len(st['names']): e.last_error = 18; return 0
+    _fill_find(e, a[1], _os.path.join(st['dir'], st['names'][st['i']]))
+    return 1
+
+REG_TREE = {
+    'software\\wow6432node\\sony corporation\\openmg':
+        {'Repository': REPO_WIN, 'ContentRootDir': CONTENT_WIN},
+    'software\\sony corporation\\openmg':
+        {'Repository': REPO_WIN, 'ContentRootDir': CONTENT_WIN},
+}
+def _reg_full(hkey, sub):
+    roots = {0x80000002: '', 0x80000001: 'hkcu\\', 0x80000000: 'hkcr\\'}
+    if hkey in e_reg_handles: base = e_reg_handles[hkey]
+    else: base = roots.get(hkey, '')
+    return (base + '\\' + sub).strip('\\').lower() if sub else base.lower()
+e_reg_handles = {}
+def h_RegOpenKeyExA(e, a, x):
+    full = _reg_full(a[0], e.cstr(a[1]) if a[1] else '')
+    if full in REG_TREE or full == '' or full.startswith('software\\sony corporation') or full.startswith('software\\wow6432node\\sony corporation'):
+        h = e.next_hkey; e.next_hkey += 4
+        e_reg_handles[h] = full
+        if a[4]: e.w32(a[4], h)
+        return 0
+    if a[4]: e.w32(a[4], 0)
+    return 2
+def h_RegQueryValueExA(e, a, x):
+    full = e_reg_handles.get(a[0], '')
+    name = e.cstr(a[1]) if a[1] else ''
+    vals = REG_TREE.get(full, {})
+    hit = None
+    for k, v in vals.items():
+        if k.lower() == name.lower(): hit = v
+    if hit is None:
+        e.last_error = 2; return 2
+    data = hit.encode('latin-1') + b'\0'
+    if a[2]: e.w32(a[2], 1)                       # REG_SZ
+    if a[5]:
+        if a[3] == 0:
+            e.w32(a[5], len(data))
+        elif e.r32(a[5]) < len(data):
+            e.w32(a[5], len(data)); return 234
+        else:
+            e.wr(a[3], data); e.w32(a[5], len(data))
+    return 0
+def h_RegCloseKey(e, a, x):
+    e_reg_handles.pop(a[0], None); return 0
+def h_RegCreateKeyExA(e, a, x):
+    full = _reg_full(a[0], e.cstr(a[1]) if a[1] else '')
+    REG_TREE.setdefault(full, {})
+    h = e.next_hkey; e.next_hkey += 4
+    e_reg_handles[h] = full
+    if a[7]: e.w32(a[7], h)
+    if a[8]: e.w32(a[8], 2)
+    return 0
+def h_RegSetValueExA(e, a, x):
+    full = e_reg_handles.get(a[0], '')
+    name = e.cstr(a[1]) if a[1] else '(default)'
+    raw = e.rd(a[4], a[5]) if a[4] and a[5] else b''
+    log(f'  [reg set] {full}\\{name} type={a[3]} len={a[5]} data={raw[:64]!r}')
+    REG_TREE.setdefault(full, {})[name] = raw.rstrip(b'\0').decode('latin-1', 'replace')
+    return 0
+
+def h_GetModuleHandleA(e, a, x):
+    if a[0] == 0: return EXE_BASE
+    n = e.cstr(a[0]).lower()
+    if 'salwrap' in n: return SAL_BASE
+    if 'omgutils' in n: return OMG_BASE
+    return 0x70000000 + (abs(hash(n)) % 0x1000) * 0x10000
+def h_GetModuleHandleW(e, a, x):
+    if a[0] == 0: return EXE_BASE
+    n = e.wstr(a[0]).lower()
+    if 'salwrap' in n: return SAL_BASE
+    if 'omgutils' in n: return OMG_BASE
+    return 0x70000000 + (abs(hash(n)) % 0x1000) * 0x10000
+def h_GetModuleFileNameA(e, a, x):
+    p = {SAL_BASE: REPO_WIN + '\\salwrap.dll', OMG_BASE: REPO_WIN + '\\OMGUtils.dll',
+         EXE_BASE: 'C:\\salhost.exe'}.get(a[0], 'C:\\Windows\\system32\\kernel32.dll')
+    if a[2]: e.wr(a[1], p.encode('latin-1')[:a[2] - 1] + b'\0')
+    return min(len(p), a[2] - 1) if a[2] else 0
+def h_GetProcAddress(e, a, x):
+    if a[1] < 0x10000:
+        nm = f'#{a[1]}'
+    else:
+        nm = e.cstr(a[1])
+    spec = HLE.get(nm)
+    if spec: return e.make_stub(f'gp!{nm}', f'GetProcAddress:{nm}', spec[0], spec[1], spec[2])
+    return e.make_stub(f'gp!{nm}', f'GetProcAddress:{nm}', h_noop0, 'stdcall', 0)
+def h_LoadLibraryA(e, a, x):
+    return h_GetModuleHandleA(e, a, x)
+def h_LoadLibraryW(e, a, x):
+    return h_GetModuleHandleW(e, a, x)
+def h_GetVersionExA(e, a, x):
+    sz = e.r32(a[0])
+    e.w32(a[0] + 4, 5); e.w32(a[0] + 8, 1); e.w32(a[0] + 12, 2600)
+    e.w32(a[0] + 16, 2)
+    if sz >= 156: e.put_cstr(a[0] + 20, 'Service Pack 2')
+    return 1
+def h_GetVersion(e, a, x):  return 0x0A280105
+def h_GetSystemInfo(e, a, x):
+    e.w32(a[0] + 4, 0x1000); e.w32(a[0] + 8, 0x10000); e.w32(a[0] + 12, 0x7FFEFFFF)
+    e.w32(a[0] + 16, 1); e.w32(a[0] + 20, 1); e.w32(a[0] + 24, 586)
+    e.w32(a[0] + 32, 0x10000)
+    return 0
+def h_GetCommandLineA(e, a, x):
+    if not hasattr(e, '_cmdline'):
+        e._cmdline = e.alloc.alloc(64, 'cmdline'); e.put_cstr(e._cmdline, 'salhost.exe')
+    return e._cmdline
+def h_HeapAlloc(e, a, x):   return e.alloc.alloc(a[2], 'HeapAlloc')
+def h_HeapFree(e, a, x):    e.alloc.free(a[2]); return 1
+def h_HeapReAlloc(e, a, x): return e.alloc.realloc(a[2], a[3])
+def h_HeapSize(e, a, x):    return e.alloc.size_of(a[2])
+def h_GlobalAlloc(e, a, x): return e.alloc.alloc(a[1], 'GlobalAlloc')
+def h_GlobalLock(e, a, x):  return a[0]
+def h_VirtualAlloc(e, a, x):
+    size = (a[1] + 0xFFFF) & ~0xFFFF
+    if a[0] and VA_BASE <= a[0] < VA_BASE + VA_SIZE: return a[0]
+    got = e.va_next; e.va_next += max(size, 0x10000)
+    return got
+def h_VirtualQuery(e, a, x):
+    e.w32(a[1] + 0, a[0] & ~0xFFF); e.w32(a[1] + 4, VA_BASE)
+    e.w32(a[1] + 8, 4); e.w32(a[1] + 12, 0x10000)
+    e.w32(a[1] + 16, 0x1000); e.w32(a[1] + 24, 0x20000)
+    return 28
+def h_InterlockedIncrement(e, a, x):
+    v = (e.r32(a[0]) + 1) & 0xFFFFFFFF; e.w32(a[0], v)
+    return v - (1 << 32) if v >= (1 << 31) else v
+def h_InterlockedDecrement(e, a, x):
+    v = (e.r32(a[0]) - 1) & 0xFFFFFFFF; e.w32(a[0], v)
+    return v - (1 << 32) if v >= (1 << 31) else v
+def h_InterlockedExchange(e, a, x):
+    old = e.r32(a[0]); e.w32(a[0], a[1]); return old
+def h_InterlockedCompareExchange(e, a, x):
+    old = e.r32(a[0])
+    if old == a[2]: e.w32(a[0], a[1])
+    return old
+def h_TlsAlloc(e, a, x):
+    i = e.tls_next; e.tls_next += 1; return i
+def h_TlsSetValue(e, a, x):
+    e.tls_vals[a[0]] = a[1]
+    if a[0] < 64: e.w32(AUX_BASE + 0x6000 + a[0] * 4, a[1])
+    return 1
+def h_TlsGetValue(e, a, x):
+    return e.tls_vals.get(a[0], 0)
+def h_GetTickCount(e, a, x):
+    e.tick += 37; return e.tick
+def h_QPC(e, a, x):
+    e.tick += 100; e.wr(a[0], struct.pack('<q', e.tick * 100)); return 1
+def h_QPF(e, a, x):
+    e.wr(a[0], struct.pack('<q', 10_000_000)); return 1
+def h_GetLocalTime(e, a, x):
+    e.wr(a[0], struct.pack('<8H', 2026, 10, 4, 22, 18, 40, 0, 0)); return 0
+def h_MultiByteToWideChar(e, a, x):
+    cp, src, slen, dst, dlen = a[0], a[2], a[3], a[4], a[5]
+    if slen == 0xFFFFFFFF: slen = len(e.cstr(src)) + 1
+    if cp == 1200:
+        s = e.wstr(src, slen // 2)[:slen // 2]
+    else:
+        s = e.rd(src, slen).decode('latin-1').rstrip('\0') if slen else ''
+        if a[3] == 0xFFFFFFFF: s = e.cstr(src)
+    need = len(s) + (1 if a[3] == 0xFFFFFFFF else 0)
+    if dlen == 0: return need
+    e.put_wstr(dst, s)
+    return need
+def h_WideCharToMultiByte(e, a, x):
+    src, slen, dst, dlen = a[2], a[3], a[4], a[5]
+    if slen == 0xFFFFFFFF:
+        s = e.wstr(src); need = len(s) + 1
+    else:
+        s = e.wstr(src, slen)[:slen]; need = len(s)
+    if dlen == 0: return need
+    e.put_cstr(dst, s)
+    return need
+def h_CreateFileMappingA(e, a, x):
+    h = e.next_handle; e.next_handle += 4
+    e.handles[h] = ('mapping', a[0]); return h
+def h_MapViewOfFile(e, a, x):
+    ent = e.handles.get(a[0])
+    fsrc = e.handles.get(ent[1]) if ent else None
+    size = a[4]
+    if fsrc and fsrc[0] == 'file':
+        pos = fsrc[1].tell(); fsrc[1].seek(0, 2); total = fsrc[1].tell(); fsrc[1].seek(pos)
+        n = size if size else total
+        buf = e.alloc.alloc(n, 'MapViewOfFile')
+        fsrc[1].seek(a[2]); data = fsrc[1].read(n); fsrc[1].seek(pos)
+        if data: e.wr(buf, data)
+        return buf
+    return e.alloc.alloc(size if size else 0x1000, 'MapViewOfFile anon')
+def h_CoCreateInstance(e, a, x):
+    log('  [hle] CoCreateInstance called -> class not registered')
+    return 0x80040154
+def h_SysAllocString(e, a, x):
+    s = e.wstr(a[0]) if a[0] else ''
+    n = len(s)
+    buf = e.alloc.alloc(n * 2 + 6, 'BSTR')
+    e.w32(buf, n * 2); e.put_wstr(buf + 4, s)
+    return buf + 4
+def h_SysFreeString(e, a, x):
+    if a[0]: e.alloc.free(a[0] - 4)
+    return 0
+def h_SysStringLen(e, a, x):
+    return e.r32(a[0] - 4) // 2 if a[0] else 0
+def h_VariantInit(e, a, x):
+    e.wr(a[0], b'\0' * 16); return 0
+def h_UuidFromStringW(e, a, x):
+    s = e.wstr(a[0])
+    try:
+        parts = s.split('-')
+        b = bytes.fromhex(parts[0] + parts[1] + parts[2] + parts[3] + parts[4])
+        raw = struct.pack('<IHH', int(parts[0], 16), int(parts[1], 16), int(parts[2], 16)) + bytes.fromhex(parts[3] + parts[4])
+        e.wr(a[1], raw)
+        return 0
+    except Exception:
+        return 0x6F9
+def h_SHGetFolderPathA(e, a, x):
+    paths = {0x1A: 'C:\\Users\\Glitched7\\AppData\\Roaming', 0x24: 'C:\\Windows',
+             0x25: 'C:\\Windows\\system32', 0x26: 'C:\\Program Files (x86)',
+             0x2B: 'C:\\ProgramData', 0x05: 'C:\\Users\\Glitched7\\Documents'}
+    p = paths.get(a[1] & 0xFF, 'C:\\ProgramData')
+    e.put_cstr(a[4], p); return 0
+def h_MessageBoxA(e, a, x):
+    log(f'  [guest MessageBox] {e.cstr(a[1])!r} / {e.cstr(a[2])!r}')
+    return 1
+def h_CreateThread(e, a, x):
+    log(f'  [hle] CreateThread start={a[2]:#x} -- NOT run (single-thread harness)')
+    h = e.next_handle; e.next_handle += 4
+    e.handles[h] = ('thread', None)
+    if a[5]: e.w32(a[5], 999)
+    return h
+def h_GetStdHandle(e, a, x):
+    return {0xFFFFFFF6: 0xFFFFFFF6, 0xFFFFFFF5: 0xFFFFFFF5, 0xFFFFFFF4: 0xFFFFFFF4}.get(a[0], 0xFFFFFFF5)
+
+WIN = {
+ 'CreateFileA': (h_CreateFileA, 'stdcall', 7), 'CreateFileW': (h_CreateFileW, 'stdcall', 7),
+ 'ReadFile': (h_ReadFile, 'stdcall', 5), 'WriteFile': (h_WriteFile, 'stdcall', 5),
+ 'GetFileSize': (h_GetFileSize, 'stdcall', 2), 'SetFilePointer': (h_SetFilePointer, 'stdcall', 4),
+ 'CloseHandle': (h_CloseHandle, 'stdcall', 1), 'GetFileAttributesA': (h_GetFileAttributesA, 'stdcall', 1),
+ 'GetFileAttributesW': (h_GetFileAttributesA, 'stdcall', 1),
+ 'FindFirstFileA': (h_FindFirstFileA, 'stdcall', 2), 'FindNextFileA': (h_FindNextFileA, 'stdcall', 2),
+ 'FindClose': (h_CloseHandle, 'stdcall', 1),
+ 'RegOpenKeyExA': (h_RegOpenKeyExA, 'stdcall', 5), 'RegOpenKeyA': (h_RegOpenKeyExA, 'stdcall', 3),
+ 'RegQueryValueExA': (h_RegQueryValueExA, 'stdcall', 6),
+ 'RegCloseKey': (h_RegCloseKey, 'stdcall', 1),
+ 'RegCreateKeyExA': (h_RegCreateKeyExA, 'stdcall', 9),
+ 'RegSetValueExA': (h_RegSetValueExA, 'stdcall', 6),
+ 'RegOpenKeyExW': (h_RegOpenKeyExA, 'stdcall', 5), 'RegQueryValueExW': (h_RegQueryValueExA, 'stdcall', 6),
+ 'GetModuleHandleA': (h_GetModuleHandleA, 'stdcall', 1), 'GetModuleHandleW': (h_GetModuleHandleW, 'stdcall', 1),
+ 'GetModuleFileNameA': (h_GetModuleFileNameA, 'stdcall', 3), 'GetModuleFileNameW': (h_GetModuleFileNameA, 'stdcall', 3),
+ 'GetProcAddress': (h_GetProcAddress, 'stdcall', 2),
+ 'LoadLibraryA': (h_LoadLibraryA, 'stdcall', 1), 'LoadLibraryW': (h_LoadLibraryW, 'stdcall', 1),
+ 'LoadLibraryExA': (h_LoadLibraryA, 'stdcall', 3), 'LoadLibraryExW': (h_LoadLibraryW, 'stdcall', 3),
+ 'FreeLibrary': (h_ret1, 'stdcall', 1),
+ 'GetVersionExA': (h_GetVersionExA, 'stdcall', 1), 'GetVersionExW': (h_GetVersionExA, 'stdcall', 1),
+ 'GetVersion': (h_GetVersion, 'stdcall', 0),
+ 'GetSystemInfo': (h_GetSystemInfo, 'stdcall', 1),
+ 'GetCommandLineA': (h_GetCommandLineA, 'stdcall', 0), 'GetCommandLineW': (h_GetCommandLineA, 'stdcall', 0),
+ 'GetProcessHeap': (lambda e, a, x: 1, 'stdcall', 0),
+ 'HeapAlloc': (h_HeapAlloc, 'stdcall', 3), 'HeapFree': (h_HeapFree, 'stdcall', 3),
+ 'HeapReAlloc': (h_HeapReAlloc, 'stdcall', 4), 'HeapSize': (h_HeapSize, 'stdcall', 3),
+ 'HeapCreate': (lambda e, a, x: 2, 'stdcall', 3), 'HeapDestroy': (h_ret1, 'stdcall', 1),
+ 'HeapValidate': (h_ret1, 'stdcall', 3),
+ 'GlobalAlloc': (h_GlobalAlloc, 'stdcall', 2),
+ 'GlobalFree': (lambda e, a, x: (e.alloc.free(a[0]), a[0])[1] and 0, 'stdcall', 1),
+ 'GlobalLock': (h_GlobalLock, 'stdcall', 1), 'GlobalUnlock': (h_ret1, 'stdcall', 1),
+ 'GlobalSize': (lambda e, a, x: e.alloc.size_of(a[0]), 'stdcall', 1),
+ 'LocalAlloc': (h_GlobalAlloc, 'stdcall', 2),
+ 'LocalFree': (lambda e, a, x: (e.alloc.free(a[0]), 0)[1], 'stdcall', 1),
+ 'VirtualAlloc': (h_VirtualAlloc, 'stdcall', 4), 'VirtualFree': (h_ret1, 'stdcall', 3),
+ 'VirtualQuery': (h_VirtualQuery, 'stdcall', 3), 'VirtualProtect': (h_ret1, 'stdcall', 4),
+ 'InitializeCriticalSection': (lambda e, a, x: (e.wr(a[0], b'\0' * 24), 0)[1], 'stdcall', 1),
+ 'InitializeCriticalSectionAndSpinCount': (h_ret1, 'stdcall', 2),
+ 'EnterCriticalSection': (h_noop0, 'stdcall', 1), 'LeaveCriticalSection': (h_noop0, 'stdcall', 1),
+ 'DeleteCriticalSection': (h_noop0, 'stdcall', 1), 'TryEnterCriticalSection': (h_ret1, 'stdcall', 1),
+ 'InterlockedIncrement': (h_InterlockedIncrement, 'stdcall', 1),
+ 'InterlockedDecrement': (h_InterlockedDecrement, 'stdcall', 1),
+ 'InterlockedExchange': (h_InterlockedExchange, 'stdcall', 2),
+ 'InterlockedCompareExchange': (h_InterlockedCompareExchange, 'stdcall', 3),
+ 'InterlockedExchangeAdd': (lambda e, a, x: (lambda old: (e.w32(a[0], (old + a[1]) & 0xFFFFFFFF), old)[1])(e.r32(a[0])), 'stdcall', 2),
+ 'TlsAlloc': (h_TlsAlloc, 'stdcall', 0), 'TlsFree': (h_ret1, 'stdcall', 1),
+ 'TlsSetValue': (h_TlsSetValue, 'stdcall', 2), 'TlsGetValue': (h_TlsGetValue, 'stdcall', 1),
+ 'GetTickCount': (h_GetTickCount, 'stdcall', 0), 'timeGetTime': (h_GetTickCount, 'stdcall', 0),
+ 'QueryPerformanceCounter': (h_QPC, 'stdcall', 1), 'QueryPerformanceFrequency': (h_QPF, 'stdcall', 1),
+ 'GetLocalTime': (h_GetLocalTime, 'stdcall', 1), 'GetSystemTime': (h_GetLocalTime, 'stdcall', 1),
+ 'MultiByteToWideChar': (h_MultiByteToWideChar, 'stdcall', 6),
+ 'WideCharToMultiByte': (h_WideCharToMultiByte, 'stdcall', 8),
+ 'CreateFileMappingA': (h_CreateFileMappingA, 'stdcall', 6), 'CreateFileMappingW': (h_CreateFileMappingA, 'stdcall', 6),
+ 'MapViewOfFile': (h_MapViewOfFile, 'stdcall', 5), 'UnmapViewOfFile': (h_ret1, 'stdcall', 1),
+ 'OpenFileMappingA': (lambda e, a, x: 0, 'stdcall', 3),
+ 'CoInitialize': (h_noop0, 'stdcall', 1), 'CoInitializeEx': (h_noop0, 'stdcall', 2),
+ 'CoUninitialize': (h_noop0, 'stdcall', 0),
+ 'CoCreateInstance': (h_CoCreateInstance, 'stdcall', 5),
+ 'CoTaskMemAlloc': (lambda e, a, x: e.alloc.alloc(a[0], 'CoTaskMem'), 'stdcall', 1),
+ 'CoTaskMemFree': (h_free, 'stdcall', 1),
+ 'SysAllocString': (h_SysAllocString, 'stdcall', 1), 'SysFreeString': (h_SysFreeString, 'stdcall', 1),
+ 'SysStringLen': (h_SysStringLen, 'stdcall', 1),
+ 'VariantInit': (h_VariantInit, 'stdcall', 1), 'VariantClear': (h_noop0, 'stdcall', 1),
+ 'UuidFromStringW': (h_UuidFromStringW, 'stdcall', 2), 'UuidFromStringA': (h_UuidFromStringW, 'stdcall', 2),
+ 'SHGetFolderPathA': (h_SHGetFolderPathA, 'stdcall', 5), 'SHGetFolderPathW': (h_SHGetFolderPathA, 'stdcall', 5),
+ 'MessageBoxA': (h_MessageBoxA, 'stdcall', 4), 'MessageBoxW': (h_MessageBoxA, 'stdcall', 4),
+ 'wsprintfA': (h_sprintf, 'cdecl', 2), 'wsprintfW': (h_sprintf, 'cdecl', 2),
+ 'CreateThread': (h_CreateThread, 'stdcall', 6),
+ '_beginthreadex': (h_CreateThread, 'cdecl', 6),
+ 'GetStdHandle': (h_GetStdHandle, 'stdcall', 1),
+ 'GetCurrentProcess': (lambda e, a, x: 0xFFFFFFFF, 'stdcall', 0),
+ 'GetCurrentProcessId': (lambda e, a, x: 4242, 'stdcall', 0),
+ 'GetCurrentThreadId': (lambda e, a, x: 100, 'stdcall', 0),
+ 'GetCurrentThread': (lambda e, a, x: 0xFFFFFFFE, 'stdcall', 0),
+ 'GetLastError': (lambda e, a, x: e.last_error, 'stdcall', 0),
+ 'SetLastError': (lambda e, a, x: setattr(e, 'last_error', a[0]) or 0, 'stdcall', 1),
+ 'Sleep': (h_noop0, 'stdcall', 1),
+ 'WaitForSingleObject': (h_noop0, 'stdcall', 2), 'WaitForMultipleObjects': (h_noop0, 'stdcall', 4),
+ 'CreateMutexA': (lambda e, a, x: 0x500, 'stdcall', 3), 'CreateMutexW': (lambda e, a, x: 0x500, 'stdcall', 3),
+ 'CreateEventA': (lambda e, a, x: 0x504, 'stdcall', 4), 'CreateEventW': (lambda e, a, x: 0x504, 'stdcall', 4),
+ 'SetEvent': (h_ret1, 'stdcall', 1), 'ResetEvent': (h_ret1, 'stdcall', 1),
+ 'ReleaseMutex': (h_ret1, 'stdcall', 1),
+ 'IsDebuggerPresent': (h_noop0, 'stdcall', 0),
+ 'SetUnhandledExceptionFilter': (h_noop0, 'stdcall', 1),
+ 'OutputDebugStringA': (lambda e, a, x: log('  [dbg]', e.cstr(a[0])[:200]) or 0, 'stdcall', 1),
+ 'OutputDebugStringW': (lambda e, a, x: log('  [dbg]', e.wstr(a[0])[:200]) or 0, 'stdcall', 1),
+ 'GetACP': (lambda e, a, x: 1252, 'stdcall', 0), 'GetOEMCP': (lambda e, a, x: 437, 'stdcall', 0),
+ 'GetCPInfo': (h_ret1, 'stdcall', 2),
+ 'GetEnvironmentVariableA': (h_noop0, 'stdcall', 3), 'GetEnvironmentVariableW': (h_noop0, 'stdcall', 3),
+ 'SetEnvironmentVariableA': (h_ret1, 'stdcall', 2),
+ 'GetCurrentDirectoryA': (lambda e, a, x: (e.put_cstr(a[1], 'C:\\') if a[0] >= 4 else 4, 3)[1], 'stdcall', 2),
+ 'SetCurrentDirectoryA': (h_ret1, 'stdcall', 1),
+ 'WSAStartup': (h_noop0, 'stdcall', 2), 'WSACleanup': (h_noop0, 'stdcall', 0),
+ 'gethostname': (lambda e, a, x: (e.put_cstr(a[0], 'Glitched7-PC'), 0)[1], 'stdcall', 2),
+ 'lstrlenA': (h_strlen, 'stdcall', 1), 'lstrlenW': (lambda e, a, x: len(e.wstr(a[0])), 'stdcall', 1),
+ 'lstrcpyA': (h_strcpy, 'stdcall', 2), 'lstrcatA': (h_strcat, 'stdcall', 2),
+ 'lstrcmpA': (h_strcmp, 'stdcall', 2), 'lstrcmpiA': (h_stricmp, 'stdcall', 2),
+ 'IsBadReadPtr': (h_noop0, 'stdcall', 2), 'IsBadWritePtr': (h_noop0, 'stdcall', 2),
+ 'RaiseException': (h_abort, 'stdcall', 4),
+ 'TerminateProcess': (h_abort, 'stdcall', 2), 'ExitProcess': (h_abort, 'cdecl', 1),
+ 'GetStartupInfoA': (lambda e, a, x: (e.wr(a[0], b'\0' * 68), e.w32(a[0], 68), 0)[2], 'stdcall', 1),
+ 'GetStartupInfoW': (lambda e, a, x: (e.wr(a[0], b'\0' * 68), e.w32(a[0], 68), 0)[2], 'stdcall', 1),
+ 'FlushFileBuffers': (h_ret1, 'stdcall', 1),
+ 'SetEndOfFile': (h_ret1, 'stdcall', 1),
+ 'GetFileType': (lambda e, a, x: 1, 'stdcall', 1),
+ 'DuplicateHandle': (lambda e, a, x: (e.w32(a[6], a[2]), 1)[1], 'stdcall', 7),
+}
+HLE.update(WIN)
+
+# ================================================================ runner
+def main():
+    e = Emu()
+    uc = e.uc
+    def on_code(uc_, address, size, ud):
+        if STUB_BASE <= address < STUB_BASE + STUB_SIZE:
+            e.on_stub(address)
+    def on_bad(uc_, access, address, size, value, ud):
+        # Watchdog: if the same (pc, address) faults over and over, the
+        # growth retry is not curing it and emu_start would spin forever
+        # inside one instruction (run 33: ~15 min, zero chunks retired,
+        # no log lines). Trip to a real fault so the event gets named.
+        pc0 = uc_.reg_read(UC_X86_REG_EIP)
+        key = (pc0, address, access)
+        if getattr(e, '_fault_key', None) == key:
+            e._fault_n = getattr(e, '_fault_n', 0) + 1
+            if e._fault_n > 2000:
+                log(f'  [emu] watchdog: stuck fault pc={pc0:#x} addr={address:#x} '
+                    f'access={access} after {e._fault_n} retries')
+                e.fault = (access, address, pc0)
+                e.stop_reason = f'stuck fault pc={pc0:#x} addr={address:#x}'
+                return False
+        else:
+            e._fault_key = key; e._fault_n = 0
+        # Growable stack: the engine probes/commits pages downward from
+        # the TEB StackLimit (real Windows grows the stack via its guard
+        # page). A touch just below the mapped low edge commits more
+        # stack instead of faulting. (Runs 22/23: writes at limit-0x20
+        # and limit-0x18, tracking the base wherever it was set.)
+        low = getattr(e, 'stack_low', STACK_BASE)
+        # Silent guard commits, but only within the host exe's real stack
+        # reserve: Omgjbox.exe's PE says SizeOfStackReserve=0x100000,
+        # commit=0x1000. The probe walks the whole reserve (run 36 fielded
+        # its bottom fault exactly 0x100000 below the limit); a touch
+        # below the reserve floor is the dispatchable bottom fault.
+        if address < low and address >= STACK_BASE - 0xFF000:
+            try:
+                new_low = address & ~0xFFFF
+                p = new_low
+                while p < low:                    # 4 KiB pages; the EXE page
+                    try:                          # at 0x400000 is skipped,
+                        uc_.mem_map(p, 0x1000)    # its neighbours still map
+                    except Exception:
+                        pass
+                    p += 0x1000
+                uc_.mem_read(address, 1)          # fault page usable now?
+                e.stack_low = new_low
+                e.w32(TEB_BASE + 0x08, new_low)   # keep TEB limit honest
+                gp = getattr(e, 'grow_pcs', None)
+                if gp is None: gp = e.grow_pcs = {}
+                pc = uc_.reg_read(UC_X86_REG_EIP)
+                gp[pc] = gp.get(pc, 0) + 1
+                return True
+            except Exception:
+                pass                              # not curable: real fault
+        pc = uc_.reg_read(UC_X86_REG_EIP)
+        e.fault = (access, address, pc)
+        e.stop_reason = f'invalid access type={access} addr={address:#x} size={size} pc={pc:#x}'
+        log('  [emu]', e.stop_reason)
+        return False
+    uc.hook_add(UC_HOOK_CODE, on_code, begin=STUB_BASE, end=STUB_BASE + STUB_SIZE - 1)
+    uc.hook_add(UC_HOOK_MEM_INVALID, on_bad)
+    e.halt_stub()
+
+    global EXPORTS
+    log('loading OMGUtils.dll ...')
+    EXPORTS = e.load_pe(_os.path.join(SONY_DIR, 'OMGUtils.dll'), OMG_BASE, True)
+    log(f'  {len(EXPORTS)} exports')
+    log('loading salwrap.dll ...')
+    sal_exports = e.load_pe(_os.path.join(SONY_DIR, 'salwrap.dll'), SAL_BASE, True)
+    unresolved = [nm for nm, h, c, n in e.stubs if h is None]
+    log(f'stubs: {len(e.stubs)} total, {len(unresolved)} unresolved:')
+    for nm in unresolved: log('   ?', nm)
+
+    # Run each DLL's real entry point (DllMainCRTStartup: _initterm static
+    # ctors + the DLL's own DllMain) exactly as the Windows loader would.
+    import pefile as _pf
+    for path, b, nm in ((_os.path.join(SONY_DIR, 'OMGUtils.dll'), OMG_BASE, 'OMGUtils'),
+                        (_os.path.join(SONY_DIR, 'salwrap.dll'), SAL_BASE, 'salwrap')):
+        ep = b + _pf.PE(path).OPTIONAL_HEADER.AddressOfEntryPoint
+        r = e.call(ep, args=(b, 1, 0), label=f'{nm} DllMain')
+        log(f'{nm} entry returned {r:#x}; stop={e.stop_reason}')
+        e.stop_reason = None
+        while INITQ:
+            qb, qe = INITQ.pop(0)
+            for ptr in range(qb, qe, 4):
+                fn = e.r32(ptr)
+                if fn:
+                    e.call(fn, label=f'{nm} static ctor {fn:#x}')
+                    e.stop_reason = None
+            log(f'{nm} init table {qb:#x}..{qe:#x} drained')
+
+    # Fallback only: if a static sync object's vtable is still null (its
+    # ctor needed something we don't provide), install the no-op fake.
+    vt = AUX_BASE + 0x800
+    lock = e.make_stub('sync-lock', 'sync.vtbl lock/unlock', h_noop0, 'thiscall', 0)
+    for i in range(16): e.w32(vt + 4 * i, lock)
+    for g in (SAL_BASE + 0x6B050, OMG_BASE + 0x2DDC8):
+        if e.r32(g) == 0:
+            e.w32(g, vt); log(f'sync vtable fake installed at {g:#x}')
+
+    # ---- SEH dispatcher (the monkey single-steps under its own handler) ----
+    from unicorn.x86_const import (UC_X86_REG_EIP as _EIP, UC_X86_REG_ESP as _ESP,
+                                   UC_X86_REG_EFLAGS as _EFLAGS)
+    _insn_cnt = [0]
+    def _count_cb(uc_, address, size, ud): _insn_cnt[0] += 1
+    REC = AUX_BASE + 0x1000; CTX = AUX_BASE + 0x1400; DISP = AUX_BASE + 0x1800
+    def seh_dispatch(code, addr, info, feip, fesp):
+        e.wr(REC, b'\0' * 0x50)
+        e.w32(REC + 0x00, code); e.w32(REC + 0x0C, addr)
+        e.w32(REC + 0x10, len(info))
+        for i, v in enumerate(info): e.w32(REC + 0x14 + 4 * i, v)
+        e.snapshot_ctx(CTX, feip, fesp)
+        frame = e.r32(0)                      # SEH chain head (fs:[0] @ TEB 0)
+        log(f'  [seh] dispatch entry: code={code:#x} head={frame:#x} '
+            f'handler={(e.r32(frame + 4) if frame not in (0, 0xFFFFFFFF) else None)}')
+        if code == 0xC0000005:
+            _g = lambda o: e.r32(CTX + o)
+            log(f'  [seh] snapshot regs: eax={_g(0xB0):#x} ebx={_g(0xA4):#x} '
+                f'ecx={_g(0xAC):#x} edx={_g(0xA8):#x} esi={_g(0xA0):#x} '
+                f'edi={_g(0x9C):#x} ebp={_g(0xB4):#x} esp={_g(0xC4):#x} '
+                f'streamA={[e.r32(_g(0xC4) + 4 * i) for i in range(3)]}')
+        seen = 0
+        while frame not in (0, 0xFFFFFFFF) and seen < 32:
+            handler = e.r32(frame + 4)
+            # The engine's probe cycle reuses the head node's stack slot
+            # for its VM context record between faults (the +4 field gets
+            # overwritten by resumed-code frames), but the node's handler
+            # is a fixed property the engine installed. Remember it from
+            # the first successful dispatch at this node and reuse it
+            # when the field no longer holds a valid image address.
+            cache = getattr(seh_dispatch, '_handlers', None)
+            if cache is None: cache = seh_dispatch._handlers = {}
+            if (SAL_BASE <= handler < SAL_BASE + 0x77000 or
+                    OMG_BASE <= handler < OMG_BASE + 0x33000):
+                cache[frame] = handler
+            elif frame in cache:
+                log(f'  [seh] node {frame:#x}: handler field overwritten; '
+                    f'using installed handler {cache[frame]:#x}')
+                handler = cache[frame]
+                # Experiment (readout #20 addendum 4): cycle 2's streamB
+                # carries a return address in slot [1], which only the
+                # SPLICE handler consumes; ctxpush replays cycle 1's
+                # stale Dr2 target. For the patch function's AV with a
+                # dead head node, try the splice handler instead.
+                _feip = e.r32(CTX + 0xB8)
+                if code == 0xC0000005 and 0x65127680 <= _feip < 0x65127700:
+                    log(f'  [seh] experiment: probe AV via splice handler '
+                        f'0x65126130 instead of cached ctxpush')
+                    handler = 0x65126130
+            if handler == 0x65125420:  # ctxpush: log the splice inputs
+                _dr2 = e.r32(CTX + 0x0C)
+                _esp = e.r32(CTX + 0xC4); _ebp = e.r32(CTX + 0xB4)
+                def _rd(a):
+                    try: return e.r32(a)
+                    except Exception: return None
+                _sb0 = _rd(_ebp)
+                log(f'  [seh] ctxpush inputs: Dr2={_dr2:#x} -> Eip '
+                    f'{_dr2 ^ 0x7FFFFFFF:#x}; streamA@{_esp:#x}: '
+                    f'{[_rd(_esp + 4 * i) for i in range(3)]}; '
+                    f'streamB@{_ebp:#x}: {[_rd(_ebp + 4 * i) for i in range(2)]}; '
+                    f'frame@sb0: [sb0-0x18]={_rd(_sb0 - 0x18) if _sb0 else None} '
+                    f'[sb0-4]={_rd(_sb0 - 4) if _sb0 else None}')
+            if not (SAL_BASE <= handler < SAL_BASE + 0x77000 or
+                    OMG_BASE <= handler < OMG_BASE + 0x33000):
+                log(f'  [seh] chain exhausted: bogus handler {handler:#x} '
+                    f'at frame {frame:#x} (node repurposed?)')
+                try:
+                    log(f'  [seh] node bytes {frame:#x}: '
+                        f'{e.rd(frame, 48).hex(" ")}')
+                    log(f'  [seh] handler bytes: {e.rd(handler, 16).hex(" ")}')
+                except Exception:
+                    pass
+                return None
+            log(f'  [seh] try code={code:#x} frame={frame:#x} handler={handler:#x} '
+                f'ctxEsp={e.r32(CTX + 0xC4):#x} ctxEbp={e.r32(CTX + 0xB4):#x} '
+                f'ctxEip={e.r32(CTX + 0xB8):#x}')
+            log(f'  [seh] node pre  {frame:#x}: {e.rd(frame, 16).hex(" ")} '
+                f'head={e.r32(0):#x}')
+            disp = e.raw_call(handler, [REC, frame, CTX, DISP], label='seh handler')
+            log(f'  [seh] node post {frame:#x}: {e.rd(frame, 16).hex(" ")} '
+                f'head={e.r32(0):#x}')
+            if e.stop_reason:
+                log(f'  [seh] handler {handler:#x} faulted: {e.stop_reason}')
+                return None
+            log(f'  [seh] code={code:#x} frame={frame:#x} handler={handler:#x} -> {disp}')
+            if disp == 0: return 0
+            if disp == 1:
+                frame = e.r32(frame); seen += 1; continue
+            return disp
+        return None
+    def run_with_seh(entry, args=(), label=''):
+        r = e.call(entry, args=args, label=label)
+        rounds = 0
+        while True:
+            sr = e.stop_reason or ''
+            fault = getattr(e, 'fault', None)
+            if not (fault or 'EXCEPTION' in sr or 'INSN_INVALID' in sr or 'UcError' in sr):
+                break
+            feip = uc.reg_read(_EIP); fesp = uc.reg_read(_ESP)
+            log(f'  [seh] fault eip={feip:#x} esp={fesp:#x} '
+                f'eflags={uc.reg_read(_EFLAGS):#010x} sr={sr[:60]}')
+            if fault:
+                code, addr = 0xC0000005, fault[2]
+                info = [1 if fault[0] in (20, 21) else 0, fault[1]]
+            elif 'INSN_INVALID' in sr:
+                code, addr, info = 0xC000001D, feip, []
+            else:
+                try: prev = e.rd(feip - 1, 1)[0]
+                except Exception: prev = 0
+                if prev == 0xCC: code, addr, info = 0x80000003, feip - 1, []
+                else: code, addr, info = 0x80000004, feip, []
+            e.fault = None
+            # Stack-overflow last-page rule: when a fault at the reserve
+            # bottom is delivered, Windows commits that final page (it's
+            # what lets an overflow handler run at all). The engine's
+            # continuation store targets exactly that page (run 37:
+            # 0x6516D775 stored to floor-4 after the bottom splice).
+            if code == 0xC0000005 and info:
+                fa = info[1]
+                low = getattr(e, 'stack_low', STACK_BASE)
+                if low - 0x1000 <= fa < low:
+                    p = fa & ~0xFFF
+                    while p < low:
+                        try: uc.mem_map(p, 0x1000)
+                        except Exception: pass
+                        p += 0x1000
+                    e.stack_low = fa & ~0xFFF
+                    e.w32(TEB_BASE + 0x08, e.stack_low)
+                    log(f'  [seh] bottom-page commit to {e.stack_low:#x}')
+            disp = seh_dispatch(code, addr, info, feip, fesp)
+            rounds += 1
+            if disp is None:
+                log(f'  [seh] UNHANDLED code={code:#x} at {addr:#x}')
+                break
+            if disp != 0:
+                log(f'  [seh] disposition {disp}; stopping')
+                break
+            log(f'  [seh] edited ctx: ebp={e.r32(CTX + 0xB4):#x} '
+                f'esp={e.r32(CTX + 0xC4):#x} eip={e.r32(CTX + 0xB8):#x} '
+                f'edi={e.r32(CTX + 0x9C):#x} esi={e.r32(CTX + 0xA0):#x} '
+                f'ebx={e.r32(CTX + 0xA4):#x}')
+            new_eip = e.apply_ctx(CTX)
+            log(f'  [seh] resume regs: eip={new_eip:#x} '
+                f'ebp={uc.reg_read(UC_X86_REG_EBP):#x} '
+                f'esp={uc.reg_read(UC_X86_REG_ESP):#x} '
+                f'code={e.uc.mem_read(new_eip, 8).hex()}')
+            # One trap per trampoline arming: the engine's hop trampolines
+            # set TF themselves (pushf/or 0x100/popf) right before each hop.
+            # Leaving TF on across a splice-resume makes the CPU re-trap on
+            # the very next instruction and the splice handler then consumes
+            # a frame that was never a continuation (observed: Ebp=0x10010).
+            uc.reg_write(UC_X86_REG_EFLAGS, uc.reg_read(UC_X86_REG_EFLAGS) & ~0x100)
+            e.stop_reason = None
+            # Chunked resume: emu_start's count is translator-level (fast),
+            # unlike a Python code hook. Each exhausted chunk logs a
+            # progress line so a long VM grind is distinguishable from a
+            # wedge (run 31: 280 s inside one resume, no telemetry).
+            halt = e.halt_stub()
+            chunks = 0
+            begin = new_eip
+            while True:
+                try:
+                    uc.emu_start(begin, halt, count=500_000)
+                except UcError as ex:
+                    if getattr(e, 'fault', None) is None:
+                        e.stop_reason = f'UcError {ex} (resume)'
+                    break
+                cur = uc.reg_read(_EIP)
+                if cur == halt or e.stop_reason or getattr(e, 'fault', None):
+                    break
+                chunks += 1
+                if chunks <= 40 or chunks % 40 == 0:
+                    import time as _t
+                    log(f'  [seh] resume chunk {chunks}: eip={cur:#x} '
+                        f'esp={uc.reg_read(_ESP):#x} hle={len(TRACE)} '
+                        f't={_t.strftime("%H:%M:%S")}')
+                if chunks >= 2000:
+                    e.stop_reason = 'resume chunk cap reached'
+                    break
+                begin = cur
+            log(f'  [seh] resume eip={new_eip:#x} done after {chunks} chunks')
+            if rounds % 256 == 0:
+                log(f'  [seh] rounds={rounds} eip={new_eip:#x} hle={len(TRACE)}')
+            if rounds > 200000:
+                log('  [seh] round cap reached'); break
+        log(f'{label}: SEH rounds = {rounds}; final stop = {e.stop_reason}')
+        return uc.reg_read(UC_X86_REG_EAX)
+
+    log('calling FUN_6511D680 (manager bootstrap) ...')
+    # Trace every write into the native frame band during the D680 call
+    # so the initialization (or absence) of the per-cycle continuation
+    # frames can be attributed to specific guest PCs (readout #20).
+    from unicorn import UC_HOOK_MEM_WRITE
+    e.stack_writes = []
+    def _wr(uc_, access, address, size, value, ud):
+        if 0xF3FD000 <= address < 0xF3FE000 and len(e.stack_writes) < 400000:
+            e.stack_writes.append((uc_.reg_read(_EIP), address, size, value))
+    uc.hook_add(UC_HOOK_MEM_WRITE, _wr)
+    def _wr0(uc_, access, address, size, value, ud):
+        if address < 0x10:
+            pc = uc_.reg_read(_EIP)
+            log(f'  [wr0] write to {address:#x} size={size} val={value:#x} '
+                f'pc={pc:#x} esp={uc_.reg_read(_ESP):#x}')
+            if address == 0 and value == 0:
+                parts = []
+                for n, r in (('eax', UC_X86_REG_EAX), ('ecx', UC_X86_REG_ECX),
+                             ('edx', UC_X86_REG_EDX), ('ebx', UC_X86_REG_EBX),
+                             ('ebp', UC_X86_REG_EBP), ('esi', UC_X86_REG_ESI),
+                             ('edi', UC_X86_REG_EDI)):
+                    parts.append('%s=%#x' % (n, uc_.reg_read(r)))
+                code = bytes(uc_.mem_read(pc - 16, 40)).hex()
+                log('  [wr0] ZEROING: regs=' + ' '.join(parts) +
+                    ' code@pc-16=' + code)
+    uc.hook_add(UC_HOOK_MEM_WRITE, _wr0)
+    ctx = run_with_seh(SAL_BASE + 0x1D680, label='D680')
+    with open('/home/hatch/workspace/atrac-salwrap-work/unicorn/stack-writes.txt', 'w') as f:
+        for pc, a, sz, v in e.stack_writes:
+            f.write(f'{pc:#x} {a:#x} {sz} {v:#x}\n')
+    log(f'stack writes traced: {len(e.stack_writes)}')
+    log(f'manager ctx = {ctx:#x}')
+    gp = getattr(e, 'grow_pcs', {})
+    if gp:
+        top = sorted(gp.items(), key=lambda kv: -kv[1])[:6]
+        log('stack-growth fault PCs: ' +
+            ', '.join(f'{pc:#x}x{n}' for pc, n in top))
+    log(f'trace: {len(TRACE)} HLE calls; allocs: {len(ALLOC_LEDGER)}')
+    for t in TRACE[:120]:
+        log('   ', t)
+    if len(TRACE) > 120:
+        log('   ... last 20:')
+        for t in TRACE[-20:]: log('   ', t)
+    big = sorted(ALLOC_LEDGER, key=lambda r: -r[1])[:15]
+    log('largest allocations:')
+    for a, s, tag in big: log(f'   {a:#010x} {s:#x} ({s}) {tag}')
+    # scan committed regions for formed-image signature: name + 'bc' marker.
+    log('scanning heap for image markers ...')
+    import re
+    heap = e.rd(HEAP_BASE, e.alloc.brk - HEAP_BASE)
+    for m in re.finditer(rb'[\x20-\x7e]{3,40}\.ocm', heap):
+        log(f'   ocm name near heap {HEAP_BASE + m.start():#x}: {m.group()!r}')
+    for m in re.finditer(rb'bc\x00', heap[:0]):
+        pass
+    with open('/home/hatch/workspace/atrac-salwrap-work/unicorn/heap-dump.bin', 'wb') as f:
+        f.write(heap)
+    log(f'heap dumped ({len(heap)} bytes)')
+    try:
+        with open('/home/hatch/workspace/atrac-salwrap-work/unicorn/image-data.bin', 'wb') as f:
+            f.write(e.uc.mem_read(0x65141000, 0x30000))
+        log('image .data dumped')
+    except Exception as ex:
+        log(f'image .data dump failed: {ex}')
+    try:
+        buf = bytearray()
+        for p in range(0xF3FC000, 0xF3FE000, 0x1000):
+            try: buf += e.uc.mem_read(p, 0x1000)
+            except Exception: buf += b'\xee' * 0x1000
+        with open('/home/hatch/workspace/atrac-salwrap-work/unicorn/stack-dump.bin', 'wb') as f:
+            f.write(bytes(buf))
+        log('stack dumped')
+    except Exception as ex:
+        log(f'stack dump failed: {ex}')
+
+# (entry point lives at the very end of the file, after all HLE tables)
+
+# ================================================================ batch 2
+import socket as _socket
+def h_GetSystemTimeAsFileTime(e, a, x):
+    import time as _t
+    ft = int((_t.time() + 11644473600) * 10_000_000)
+    e.wr(a[0], struct.pack('<Q', ft)); return 0
+def h_htonl(e, a, x):  return struct.unpack('>I', struct.pack('<I', a[0]))[0]
+def h_ntohl(e, a, x):  return struct.unpack('<I', struct.pack('>I', a[0]))[0]
+def h_GetThreadContext(e, a, x):
+    flags = e.r32(a[1]) if a[1] else 0
+    e.wr(a[1], b'\0' * 716); e.w32(a[1], flags)
+    return 1
+def h_SetFileAttributes(e, a, x):  return 1
+def h_DeleteFileA(e, a, x):
+    hp = host_path(e.cstr(a[0]))
+    if hp and _os.path.exists(hp):
+        try: _os.remove(hp)
+        except OSError: pass
+    return 1
+def h_RemoveDirectory(e, a, x):
+    hp = host_path(e.cstr(a[0]))
+    if hp and _os.path.isdir(hp):
+        try: _os.rmdir(hp)
+        except OSError: pass
+    return 1
+def h_CreateDirectory(e, a, x):
+    hp = host_path(e.cstr(a[0]))
+    if hp:
+        try: _os.makedirs(hp, exist_ok=True)
+        except OSError: pass
+    return 1
+def h_CopyFileA(e, a, x):
+    import shutil
+    s, d = host_path(e.cstr(a[0])), host_path(e.cstr(a[1]))
+    if s and d and _os.path.exists(s):
+        try: shutil.copyfile(s, d); return 1
+        except OSError: return 0
+    return 0
+def h_MoveFileA(e, a, x):
+    s, d = host_path(e.cstr(a[0])), host_path(e.cstr(a[1]))
+    if s and d and _os.path.exists(s):
+        try: _os.replace(s, d); return 1
+        except OSError: return 0
+    return 0
+def h_GetFullPathNameA(e, a, x):
+    p = e.cstr(a[0])
+    if not (len(p) > 1 and p[1] == ':'):
+        p = 'C:\\' + p.lstrip('\\')
+    if a[2]: e.wr(a[2], p.encode('latin-1')[:a[2] - 1] + b'\0')
+    return len(p)
+def h_FormatMessageA(e, a, x):
+    # FORMAT_MESSAGE_FROM_SYSTEM-ish: hand back a generic string
+    msg = 'The operation completed successfully.\0'
+    if a[6]:
+        buf = e.alloc.alloc(len(msg) + 1, 'FormatMessage')
+        e.put_cstr(buf, msg.rstrip('\0')); e.w32(a[6], buf)
+        return len(msg) - 1
+    if a[4]: e.wr(a[4], msg.encode('latin-1')[:a[5] - 1] + b'\0')
+    return len(msg) - 1
+def h_GetLocaleInfoA(e, a, x):
+    vals = {0x1001: 'ENU', 0x409: 'en', 0x21009: ''}
+    s = vals.get(a[1], '')
+    if a[3]:
+        if a[3] == 0: return len(s) + 1
+        e.put_cstr(a[2], s)
+    return len(s) + 1
+# --- security descriptors / SIDs (benign but structurally plausible)
+def h_InitSD(e, a, x):
+    e.wr(a[0], b'\0' * 20); e.wr(a[0], b'\x01'); return 1
+def h_InitAcl(e, a, x):
+    e.wr(a[0], struct.pack('<BBHHH', 2, 0, a[1], 0, 0)); return 1
+def h_AllocSid(e, a, x):
+    n = a[8]
+    sid = e.alloc.alloc(8 + 4 * n, 'SID')
+    e.wr(sid, struct.pack('<BB', 1, n) + b'\0\0\0\0\0\5')
+    for i in range(n): e.w32(sid + 8 + 4 * i, a[i])
+    if a[9] if len(a) > 9 else False: pass
+    return 1  # note: real API returns BOOL with pSid written via a[9]
+def h_AllocSid2(e, a, x):
+    # AllocateAndInitializeSid(auth, n, s0..s7, **pSid): args[10] = out ptr
+    n = a[1]
+    sid = e.alloc.alloc(8 + 4 * max(n, 1), 'SID')
+    auth = e.rd(a[0], 6) if a[0] else b'\0\0\0\0\0\5'
+    e.wr(sid, struct.pack('<BB', 1, n) + auth)
+    for i in range(n): e.w32(sid + 8 + 4 * i, a[2 + i])
+    e.w32(a[10], sid)
+    return 1
+def h_GetLengthSid(e, a, x):
+    return 8 + 4 * e.rd(a[0], 2)[1] if a[0] else 0
+def h_CopySid(e, a, x):
+    n = h_GetLengthSid(e, [a[1]], x)
+    e.wr(a[0], e.rd(a[1], n)); return 1
+def h_GetSidSubAuthority(e, a, x):
+    return a[0] + 8 + 4 * a[1]
+def h_OpenProcessToken(e, a, x):
+    if a[2]: e.w32(a[2], 0x600)
+    return 1
+def h_GetTokenInformation(e, a, x):
+    if a[4]: e.w32(a[4], 16)
+    if a[2] and a[3] >= 8:
+        sid = e.alloc.alloc(12, 'SID token')
+        e.wr(sid, struct.pack('<BB', 1, 1) + b'\0\0\0\0\0\5' + struct.pack('<I', 1000))
+        e.w32(a[2], sid); e.w32(a[2] + 4, 0)
+    return 1
+BATCH2 = {
+ 'GetSystemTimeAsFileTime': (h_GetSystemTimeAsFileTime, 'stdcall', 1),
+ 'htonl': (h_htonl, 'stdcall', 1), 'ntohl': (h_ntohl, 'stdcall', 1),
+ 'GetThreadContext': (h_GetThreadContext, 'stdcall', 2),
+ 'SetThreadContext': (h_ret1, 'stdcall', 2),
+ 'SuspendThread': (h_noop0, 'stdcall', 1), 'ResumeThread': (h_noop0, 'stdcall', 1),
+ 'SetFileAttributesA': (h_SetFileAttributes, 'stdcall', 2), 'SetFileAttributesW': (h_SetFileAttributes, 'stdcall', 2),
+ 'DeleteFileA': (h_DeleteFileA, 'stdcall', 1), 'DeleteFileW': (h_DeleteFileA, 'stdcall', 1),
+ 'RemoveDirectoryA': (h_RemoveDirectory, 'stdcall', 1), 'RemoveDirectoryW': (h_RemoveDirectory, 'stdcall', 1),
+ 'CreateDirectoryA': (h_CreateDirectory, 'stdcall', 2), 'CreateDirectoryW': (h_CreateDirectory, 'stdcall', 2),
+ 'CopyFileA': (h_CopyFileA, 'stdcall', 3), 'CopyFileW': (h_CopyFileA, 'stdcall', 3),
+ 'MoveFileA': (h_MoveFileA, 'stdcall', 2), 'MoveFileW': (h_MoveFileA, 'stdcall', 2),
+ 'GetFullPathNameA': (h_GetFullPathNameA, 'stdcall', 4), 'GetFullPathNameW': (h_GetFullPathNameA, 'stdcall', 4),
+ 'FormatMessageA': (h_FormatMessageA, 'stdcall', 7), 'FormatMessageW': (h_FormatMessageA, 'stdcall', 7),
+ 'GetLocaleInfoA': (h_GetLocaleInfoA, 'stdcall', 4), 'GetLocaleInfoW': (h_GetLocaleInfoA, 'stdcall', 4),
+ 'GetThreadLocale': (lambda e, a, x: 0x0409, 'stdcall', 0),
+ 'FindResourceA': (h_noop0, 'stdcall', 3), 'FindResourceW': (h_noop0, 'stdcall', 3),
+ 'LoadResource': (h_noop0, 'stdcall', 2), 'LockResource': (h_noop0, 'stdcall', 1),
+ 'SizeofResource': (h_noop0, 'stdcall', 2), 'FreeResource': (h_ret1, 'stdcall', 1),
+ 'CreateSemaphoreA': (lambda e, a, x: 0x508, 'stdcall', 4), 'ReleaseSemaphore': (h_ret1, 'stdcall', 3),
+ 'RegDeleteKeyA': (h_noop0, 'stdcall', 2), 'RegDeleteKeyW': (h_noop0, 'stdcall', 2),
+ 'RegDeleteValueA': (h_noop0, 'stdcall', 2),
+ 'InitializeSecurityDescriptor': (h_InitSD, 'stdcall', 2),
+ 'SetSecurityDescriptorDacl': (h_ret1, 'stdcall', 4),
+ 'SetSecurityDescriptorOwner': (h_ret1, 'stdcall', 3),
+ 'SetSecurityDescriptorGroup': (h_ret1, 'stdcall', 3),
+ 'GetSecurityDescriptorLength': (lambda e, a, x: 20, 'stdcall', 1),
+ 'GetSecurityDescriptorControl': (lambda e, a, x: (e.w32(a[1], 0x8004) if a[1] else 0, e.w32(a[2], 0) if a[2] else 0, 1)[2], 'stdcall', 3),
+ 'GetSecurityDescriptorDacl': (lambda e, a, x: (e.w32(a[1], 0) if a[1] else 0, e.w32(a[3], 0) if a[3] else 0, 1)[2], 'stdcall', 4),
+ 'GetSecurityDescriptorOwner': (lambda e, a, x: (e.w32(a[1], 0) if a[1] else 0, 1)[1], 'stdcall', 2),
+ 'GetSecurityDescriptorGroup': (lambda e, a, x: (e.w32(a[1], 0) if a[1] else 0, 1)[1], 'stdcall', 2),
+ 'GetSecurityDescriptorSacl': (lambda e, a, x: (e.w32(a[1], 0) if a[1] else 0, e.w32(a[3], 0) if a[3] else 0, 1)[2], 'stdcall', 4),
+ 'MakeSelfRelativeSD': (h_ret1, 'stdcall', 3), 'MakeAbsoluteSD': (h_ret1, 'stdcall', 11),
+ 'InitializeAcl': (h_InitAcl, 'stdcall', 3), 'AddAce': (h_ret1, 'stdcall', 3),
+ 'AddAccessAllowedAce': (h_ret1, 'stdcall', 4),
+ 'GetAclInformation': (h_ret1, 'stdcall', 4),
+ 'AllocateAndInitializeSid': (h_AllocSid2, 'stdcall', 11),
+ 'InitializeSid': (lambda e, a, x: (e.wr(a[0], struct.pack('<BB', 1, a[2]) + (e.rd(a[1], 6) if a[1] else b'\0'*6)), 1)[1], 'stdcall', 3),
+ 'GetLengthSid': (h_GetLengthSid, 'stdcall', 1), 'CopySid': (h_CopySid, 'stdcall', 3),
+ 'IsValidSid': (h_ret1, 'stdcall', 1),
+ 'EqualSid': (lambda e, a, x: 1 if e.rd(a[0], h_GetLengthSid(e, [a[0]], x)) == e.rd(a[1], h_GetLengthSid(e, [a[1]], x)) else 0, 'stdcall', 2),
+ 'GetSidLengthRequired': (lambda e, a, x: 8 + 4 * a[0], 'stdcall', 1),
+ 'GetSidSubAuthority': (h_GetSidSubAuthority, 'stdcall', 2),
+ 'GetSidSubAuthorityCount': (lambda e, a, x: a[0] + 1, 'stdcall', 1),
+ 'FreeSid': (h_noop0, 'stdcall', 1),
+ 'OpenProcessToken': (h_OpenProcessToken, 'stdcall', 3),
+ 'GetTokenInformation': (h_GetTokenInformation, 'stdcall', 5),
+ 'CoCreateGuid': (lambda e, a, x: (e.wr(a[0], bytes(range(16))), 0)[1], 'stdcall', 1),
+ 'SHGetSpecialFolderPathW': (h_SHGetFolderPathA, 'stdcall', 4),
+ 'SHGetSpecialFolderPathA': (h_SHGetFolderPathA, 'stdcall', 4),
+ 'wvsprintfA': (h_vsprintf, 'cdecl', 3), 'wvsprintfW': (h_vsprintf, 'cdecl', 3),
+ # MSVC iostream / string extras (logging paths; benign)
+ '?setf@ios_base@std@@QAEHHH@Z': (lambda e, a, x: 0, 'thiscall', 2),
+ '??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@H@Z': (lambda e, a, x: x, 'thiscall', 1),
+ '??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@P6AAAVios_base@1@AAV21@@Z@Z': (lambda e, a, x: x, 'thiscall', 1),
+ '?setw@std@@YA?AU?$_Smanip@H@1@H@Z': (lambda e, a, x: (e.w32(a[0] + 4, a[1]), a[0])[1], 'cdecl', 2),
+ '?size@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QBEIXZ':
+   (lambda e, a, x: e.r32(x + 0x14), 'thiscall', 0),
+ '?unget@?$basic_istream@DU?$char_traits@D@std@@@std@@QAEAAV12@XZ': (lambda e, a, x: x, 'thiscall', 0),
+ '?get@?$basic_istream@DU?$char_traits@D@std@@@std@@QAEAAV12@AAD@Z':
+   (lambda e, a, x: (e.wr(a[0], b'\0'), x)[1], 'thiscall', 1),
+ '??Bios_base@std@@QBEPAXXZ': (lambda e, a, x: x, 'thiscall', 0),
+}
+HLE.update(BATCH2)
+# string insert / append-char need the string helpers; register separately
+def h_str_insert(e, a, x):
+    s = _sdata(e, x, 1); add = e.cstr(a[1])
+    _sset(e, x, s[:a[0]] + add + s[a[0]:], 1); return x
+def h_str_append_ch(e, a, x):
+    _sappend(e, x, chr(a[0] & 0xFF), 1); return x
+def h_str_append_wch(e, a, x):
+    _sappend(e, x, chr(a[0] & 0xFFFF), 2); return x
+HLE['?insert@?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEAAV12@IPBD@Z'] = (h_str_insert, 'thiscall', 2)
+HLE['??Y?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEAAV01@D@Z'] = (h_str_append_ch, 'thiscall', 1)
+HLE['??Y?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@QAEAAV01@G@Z'] = (h_str_append_wch, 'thiscall', 1)
+
+# (entry point at the very end of the file)
+
+# ================================================================ batch 3
+def h_rand(e, a, x):
+    e._rand_seed = (getattr(e, '_rand_seed', 1) * 214013 + 2531011) & 0xFFFFFFFF
+    return (e._rand_seed >> 16) & 0x7FFF
+def h_srand(e, a, x):
+    e._rand_seed = a[0]; return 0
+BATCH_RAND = {
+ 'rand': (h_rand, 'cdecl', 0), 'srand': (h_srand, 'cdecl', 1),
+ '_set_error_mode': (h_noop0, 'cdecl', 1), 'signal': (h_noop0, 'cdecl', 2),
+ '_getpid': (lambda e, a, x: 4242, 'cdecl', 0),
+}
+HLE.update(BATCH_RAND)
+def h_GetProcessAffinityMask(e, a, x):
+    if a[1]: e.w32(a[1], 1)
+    if a[2]: e.w32(a[2], 1)
+    return 1
+def h_GlobalMemoryStatusEx(e, a, x):
+    e.w32(a[0] + 0, 64)
+    e.w32(a[0] + 4, 50)                                  # dwMemoryLoad
+    e.wr(a[0] + 8, struct.pack('<Q', 2 << 30))           # ullTotalPhys
+    e.wr(a[0] + 16, struct.pack('<Q', 1 << 30))          # ullAvailPhys
+    e.wr(a[0] + 24, struct.pack('<Q', 2 << 30))          # ullTotalPageFile
+    e.wr(a[0] + 32, struct.pack('<Q', 2 << 30))
+    e.wr(a[0] + 40, struct.pack('<Q', 0x7FFE0000))       # ullTotalVirtual
+    e.wr(a[0] + 48, struct.pack('<Q', 0x7F000000))
+    return 1
+BATCH3 = {
+ 'GetProcessAffinityMask': (h_GetProcessAffinityMask, 'stdcall', 3),
+ 'SetProcessAffinityMask': (h_ret1, 'stdcall', 2),
+ 'SetThreadAffinityMask': (lambda e, a, x: 1, 'stdcall', 2),
+ 'GetCurrentProcessorNumber': (h_noop0, 'stdcall', 0),
+ 'SwitchToThread': (h_noop0, 'stdcall', 0),
+ 'GetNativeSystemInfo': (h_GetSystemInfo, 'stdcall', 1),
+ 'GlobalMemoryStatus': (h_GlobalMemoryStatusEx, 'stdcall', 1),
+ 'GlobalMemoryStatusEx': (h_GlobalMemoryStatusEx, 'stdcall', 1),
+ 'GetDiskFreeSpaceExA': (lambda e, a, x: (e.wr(a[1], struct.pack('<Q', 1 << 33)) if a[1] else 0,
+                                          e.wr(a[2], struct.pack('<Q', 1 << 33)) if a[2] else 0, 1)[2], 'stdcall', 4),
+ 'GetDiskFreeSpaceA': (lambda e, a, x: (e.w32(a[1], 8) if a[1] else 0, e.w32(a[2], 512) if a[2] else 0,
+                                        e.w32(a[3], 1 << 20) if a[3] else 0, e.w32(a[4], 1 << 21) if a[4] else 0, 1)[4], 'stdcall', 5),
+}
+HLE.update(BATCH3)
+
+# ================================================================ batch 4
+# The monkey's covert channel: Get/SetThreadContext with
+# ContextFlags=0x10010 (CONTEXT_DEBUG_REGISTERS) pass pointers through
+# Dr0..Dr7 (proven from the zlib-wrapper decompilation: pointers are
+# stashed NOT/XOR-encoded across calls; Dr7 carries sentinels
+# 0x11110455/0x11110400). The harness keeps the debug registers as
+# per-thread state that persists between calls. GP fields are filled
+# only if a caller ever asks for them.
+def _dr(e):
+    if not hasattr(e, 'dr'):
+        e.dr = [0] * 8
+    return e.dr
+def h_GetThreadContext2(e, a, x):
+    from unicorn.x86_const import (UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX,
+        UC_X86_REG_EDX, UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_EBP,
+        UC_X86_REG_ESP, UC_X86_REG_EFLAGS)
+    uc = e.uc; ctx = a[1]
+    flags = e.r32(ctx)
+    dr = _dr(e)
+    for i, off in enumerate((0x04, 0x08, 0x0C, 0x10, 0x14, 0x18)):
+        src = (dr[0], dr[1], dr[2], dr[3], dr[6], dr[7])[i]
+        e.w32(ctx + off, src)
+    if flags & 0x07:  # CONTROL/INTEGER/SEGMENTS requested: fill GP too
+        w = lambda off, v: e.w32(ctx + off, v)
+        w(0x9C, uc.reg_read(UC_X86_REG_EDI)); w(0xA0, uc.reg_read(UC_X86_REG_ESI))
+        w(0xA4, uc.reg_read(UC_X86_REG_EBX)); w(0xA8, uc.reg_read(UC_X86_REG_EDX))
+        w(0xAC, uc.reg_read(UC_X86_REG_ECX)); w(0xB0, uc.reg_read(UC_X86_REG_EAX))
+        w(0xB4, uc.reg_read(UC_X86_REG_EBP))
+        w(0xB8, getattr(e, '_cur_retaddr', 0))
+        w(0xC0, uc.reg_read(UC_X86_REG_EFLAGS))
+        w(0xC4, getattr(e, '_cur_esp', 0) + 4)
+    return 1
+def h_SetThreadContext2(e, a, x):
+    flags = e.r32(a[1])
+    if not hasattr(e, '_stc_flags'):
+        e._stc_flags = set()
+    if flags not in e._stc_flags:
+        e._stc_flags.add(flags)
+        log(f'  [hle] SetThreadContext flags={flags:#x}')
+    if flags & 0x10010:  # CONTEXT_DEBUG_REGISTERS: only then do the
+        # Dr fields in the caller's struct carry meaning. A GP-only Set
+        # must not clobber the mailbox state with stale struct bytes.
+        dr = _dr(e)
+        vals = [e.r32(a[1] + off) for off in (0x04, 0x08, 0x0C, 0x10, 0x14, 0x18)]
+        dr[0], dr[1], dr[2], dr[3], dr[6], dr[7] = vals
+        log(f'  [hle] SetThreadContext Dr: {[hex(v) for v in vals]}')
+    return 1
+HLE['GetThreadContext'] = (h_GetThreadContext2, 'stdcall', 2)
+HLE['SetThreadContext'] = (h_SetThreadContext2, 'stdcall', 2)
+
+if __name__ == '__main__':
+    main()
