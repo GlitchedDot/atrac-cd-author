@@ -1140,7 +1140,7 @@ def main():
         # commit=0x1000. The probe walks the whole reserve (run 36 fielded
         # its bottom fault exactly 0x100000 below the limit); a touch
         # below the reserve floor is the dispatchable bottom fault.
-        if address < low and address >= STACK_BASE - 0xFF000:
+        if address < low and address >= STACK_BASE - int(os.environ.get('SAL_RESERVE', '0xFF000'), 0):
             try:
                 new_low = address & ~0xFFFF
                 p = new_low
@@ -1404,6 +1404,11 @@ def main():
         if 0xF3FD000 <= address < 0xF3FE000 and len(e.stack_writes) < 400000:
             e.stack_writes.append((uc_.reg_read(_EIP), address, size, value))
     uc.hook_add(UC_HOOK_MEM_WRITE, _wr)
+    e.vm_writes = []
+    def _wrv(uc_, access, address, size, value, ud):
+        if 0xDEE0000 <= address < 0xDF20000 and len(e.vm_writes) < 400000:
+            e.vm_writes.append((uc_.reg_read(_EIP), address, size, value))
+    uc.hook_add(UC_HOOK_MEM_WRITE, _wrv)
     def _wr0(uc_, access, address, size, value, ud):
         if address < 0x10:
             pc = uc_.reg_read(_EIP)
@@ -1425,6 +1430,11 @@ def main():
         for pc, a, sz, v in e.stack_writes:
             f.write(f'{pc:#x} {a:#x} {sz} {v:#x}\n')
     log(f'stack writes traced: {len(e.stack_writes)}')
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'vm-writes.txt'), 'w') as fh:
+        for pc, a, sz, v in e.vm_writes:
+            fh.write(f'{pc:#x} {a:#x} {sz} {v:#x}\n')
+    log(f'vm writes traced: {len(e.vm_writes)}')
     log(f'manager ctx = {ctx:#x}')
     gp = getattr(e, 'grow_pcs', {})
     if gp:

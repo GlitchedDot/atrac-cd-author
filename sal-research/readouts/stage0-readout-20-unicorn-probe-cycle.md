@@ -203,4 +203,39 @@ families serve different shim types.)
   which register it expects to hold the node/ctx pointer, then
   check what the splice actually supplied in that register
   (streamA for that cycle read [0,0,0] — the likely gap).
+
+## Addendum 6 — runs 60–66: frame anatomy, phase sweep NEGATIVE, node clobber identified
+
+- The march is frame-laying: a 0x38-byte record per stop —
+  {twin-ret 0x6516D77A, STOP 0x20001000, probe-ret 0x651276AA, 0,
+  4, 0x40, link=B+0x1C} — written by the probe (0x65127696..A4)
+  interleaved with the VM twin (0x6516D770/775). Each bottom fault
+  interrupts the record at a different store; streamA is simply
+  whatever fields are already stored (march 1: [4, 0x40, link];
+  march 2: gap zeros; march 3: [0, 4, 64]).
+- Phase sweep (SAL_RESERVE knob added): reserves 0x100000..
+  0x105000 all die at SEH round 10, UNHANDLED — deeper reserves
+  only move the final fault ~64 KiB deeper (0x65127696 at
+  0xDEEDFE4). The reserve phase is NOT the lever. Knob kept
+  (default unchanged).
+- Node clobber — the march-3 death's root, traced in the native
+  band (run 62 write indices): the head node 0xF3FD4C0 is installed
+  at line 230 (mailbox shim, handler = splice 0x65126130), re-armed
+  to ctxpush by the stamper (write #751, pc 0x6516AA56), consumed
+  by AV#1's genuine ctxpush dispatch (#926, link advance). Then,
+  between AV#1 and AV#2, **the probe's own march-2 descent lays
+  frames across the node slot**: #1046 pc 0x65127696 writes the
+  link value 0xF3FD4C8 over node+4, #1047 pc 0x65127697 writes
+  0x40 over node+0. AV#2's dispatch therefore finds a frame
+  record, not a node; the splice resume from it runs the stamper
+  with esi=0 (gap streamA), whose table store zeroes fs:[0]
+  (pc 0x6516AA1D); AV#3 has no chain.
+- The narrowed question: in the real flow the clobbered node
+  cannot be the live chain head at AV#2 — either the owning shim
+  returns first (restoring fs:[0] to the next node) or the engine
+  re-installs before the fault. Neither happens in the emulation:
+  no fs:[0] write at all occurs between the install (line 230)
+  and the zeroing (line 282). The divergence is in how cycle 1's
+  resume re-enters the shim structure — the shim's epilogue /
+  return path is the next thing to trace.
 FUN_6511D680 still has not returned; no init.ocm fetch yet.
