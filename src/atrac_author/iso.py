@@ -39,10 +39,18 @@ def _be32(n): return struct.pack(">I", n)
 def _both32(n): return _le32(n) + _be32(n)
 
 
-def _timestamps():
+def _timestamps(timestamp: datetime | None = None):
     """(dir-record 7-byte date [local], PVD 17-byte timestamp [UTC
-    digits + local offset byte]) for one shared instant."""
-    now_local = datetime.now().astimezone()
+    digits + local offset byte]) for one shared instant: now, or
+    `timestamp`. A tz-aware `timestamp` is used as given (its own
+    offset is the "local" offset), so the result doesn't depend on
+    the machine's time zone; a naive one is read as local time."""
+    if timestamp is None:
+        now_local = datetime.now().astimezone()
+    elif timestamp.utcoffset() is None:
+        now_local = timestamp.astimezone()
+    else:
+        now_local = timestamp
     now_utc = now_local.astimezone(timezone.utc)
     offset = now_local.utcoffset()
     tz = int(offset.total_seconds() // 900) if offset else 0
@@ -206,14 +214,17 @@ def _dir_bytes(d: _Dir, file_extents: dict[str, int],
 
 
 def write_iso(files: dict[str, bytes], out_path: str,
-              vol_ident: str = "") -> int:
+              vol_ident: str = "", timestamp: datetime | None = None) -> int:
     """files: ISO path ('/TRACK.NDB', '/HIFI/TRK00001.ATP') ->
     contents. Layout mirrors the original burner's, per the module
     docstring. vol_ident defaults to blank — real discs carry a
-    blank (all-spaces) volume identifier. Returns the ISO size."""
+    blank (all-spaces) volume identifier. timestamp (default: now) is
+    the instant stamped into the PVD and directory records; pass a
+    fixed, tz-aware datetime for a byte-reproducible image. Returns
+    the ISO size."""
     sizes = {p: len(data) for p, data in files.items()}
     order, (lt, mt), file_extents, total = _plan(sizes)
-    date7, pvd17 = _timestamps()
+    date7, pvd17 = _timestamps(timestamp)
     root = order[0]
 
     img = bytearray(total * SECTOR)

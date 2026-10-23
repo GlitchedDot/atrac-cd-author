@@ -44,6 +44,8 @@ ATRAC CDs without SonicStage.
   compares byte-for-byte (needs the reference files locally).
 - `build_ladder.py` — builds a nine-bitrate ladder test disc
   (48–352 kbps) using the open-source atracdenc encoder.
+- `tests/` — self-contained unit tests; no reference discs or Sony
+  data needed. Run: `python3 -m unittest discover -s tests -v`
 
 ## Notes
 

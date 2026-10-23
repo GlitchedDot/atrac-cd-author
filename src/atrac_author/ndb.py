@@ -20,8 +20,25 @@ MAX_STRING_CHARS = STRING_FIELD_LEN // 2   # 30 UTF-16 code units
 
 
 def clamp_string(s: str) -> str:
-    """The format stores at most 30 UTF-16 code units per string."""
-    return s[:MAX_STRING_CHARS]
+    """The format stores at most 30 UTF-16 code units per string.
+
+    The cut is made on UTF-16 code units, not code points: a character
+    outside the BMP takes two units and is kept whole or dropped whole,
+    never split. Lone surrogates (what undecodable bytes in a filename
+    or tag become in a Python str) can't be encoded, so each one is
+    replaced with U+FFFD."""
+    out = []
+    units = 0
+    for ch in s:
+        cp = ord(ch)
+        if 0xD800 <= cp <= 0xDFFF:
+            ch, cp = chr(0xFFFD), 0xFFFD
+        n = 2 if cp > 0xFFFF else 1
+        if units + n > MAX_STRING_CHARS:
+            break
+        out.append(ch)
+        units += n
+    return "".join(out)
 
 
 def write_ndb(strings: list[str]) -> bytes:

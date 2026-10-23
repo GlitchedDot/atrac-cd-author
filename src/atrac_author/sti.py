@@ -86,7 +86,12 @@ class Toc:
               rng: random.Random) -> "Toc":
         tracks = []
         for i, fc in enumerate(frame_counts, start=1):
-            g = next(k for k, (a, b) in enumerate(group_ranges, start=1) if a <= i <= b)
+            g = next((k for k, (a, b) in enumerate(group_ranges, start=1)
+                      if a <= i <= b), None)
+            if g is None:
+                raise ValueError(
+                    f"track {i} is not covered by any group "
+                    f"(group ranges, 1-based inclusive: {group_ranges})")
             tracks.append(TocTrack(i, g, fc))
         return cls(
             tracks=tracks,

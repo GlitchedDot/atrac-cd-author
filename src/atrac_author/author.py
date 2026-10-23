@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import random
 from dataclasses import dataclass
+from datetime import datetime
 
 from . import atp, capacity, iso as iso_mod, ndb, sti, stk
 from .secure_header import SecureHeader
@@ -57,17 +58,21 @@ def build_iso(tracks: list[TrackInput], out_path: str,
               capacity_sectors: int = 360000,
               groups: list[tuple[str, int, int]] | None = None,
               vol_ident: str = "",
-              rng: random.Random | None = None) -> dict:
+              rng: random.Random | None = None,
+              timestamp: datetime | None = None) -> dict:
     """Full pipeline with capacity enforcement. Refuses (raising
     capacity.CapacityError) before writing anything if the ISO plus
     the burn's session overhead is over the blank, and again after
     the build on the exact ISO size. vol_ident defaults to blank —
     real SonicStage discs carry an all-spaces volume identifier.
-    Returns a stats dict."""
+    timestamp (default: now) is stamped into the ISO; pass a fixed,
+    tz-aware datetime together with a seeded rng for a byte-
+    reproducible image. Returns a stats dict."""
     files = build_tree(tracks, groups=groups, rng=rng)
     sizes = {p: len(d) for p, d in files.items()}
     est_sectors = capacity.check_capacity(sizes, capacity_sectors)
-    iso_bytes_written = iso_mod.write_iso(files, out_path, vol_ident)
+    iso_bytes_written = iso_mod.write_iso(files, out_path, vol_ident,
+                                          timestamp=timestamp)
     exact_sectors = -(-iso_bytes_written // capacity.SECTOR)
     if exact_sectors + capacity.SESSION_OVERHEAD_SECTORS > capacity_sectors:
         import os
