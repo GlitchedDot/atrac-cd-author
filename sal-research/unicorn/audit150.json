@@ -1,0 +1,131 @@
+[
+ [
+  "WINDOW",
+  {
+   "mark": "pfcom-probe-start"
+  }
+ ],
+ [
+  "_access",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/procfile/",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/procfile/",
+   "mode": 0,
+   "exists": true
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/procfile/BB/",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/procfile/BB/",
+   "result": "0x10"
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "result": "0x80"
+  }
+ ],
+ [
+  "CreateFile",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "access": "0xc0000000",
+   "disp": 3,
+   "existed": true,
+   "size": 232,
+   "result": "handle=0x138"
+  }
+ ],
+ [
+  "GetFileSize",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "size": 232
+  }
+ ],
+ [
+  "ReadFile",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "handle": "0x138",
+   "n": 232,
+   "got": 232,
+   "md5": "21a07d832d170cdc9e61bd3b58b9d34c",
+   "hex": null
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist.dat",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/maclist.dat",
+   "result": "0x80"
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist1.dat",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/maclist1.dat",
+   "result": "0x80"
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist2.dat",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/maclist2.dat",
+   "result": "FAIL"
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist1.dat",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/maclist1.dat",
+   "result": "0x80"
+  }
+ ],
+ [
+  "CreateFile",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist1.dat",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/repo-mirror/maclist1.dat",
+   "access": "0x80000000",
+   "disp": 3,
+   "existed": true,
+   "size": 21420,
+   "result": "handle=0x13c"
+  }
+ ],
+ [
+  "GetFileSize",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist1.dat",
+   "size": 21420
+  }
+ ],
+ [
+  "ReadFile",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist1.dat",
+   "handle": "0x13c",
+   "n": 21420,
+   "got": 21420,
+   "md5": "2d026c138138354f596c65716a3808ce",
+   "hex": null
+  }
+ ],
+ [
+  "WINDOW",
+  {
+   "mark": "vt8-end"
+  }
+ ]
+]

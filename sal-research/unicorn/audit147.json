@@ -1,0 +1,133 @@
+[
+ [
+  "WINDOW",
+  {
+   "mark": "pfcom-probe-start"
+  }
+ ],
+ [
+  "_access",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/procfile/",
+   "host": "/procfile/",
+   "mode": 0,
+   "exists": false
+  }
+ ],
+ [
+  "_access",
+  {
+   "win": "C:\\Windows\\system32/procfile/",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/root/Windows/system32/procfile/",
+   "mode": 0,
+   "exists": true
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Windows\\system32/procfile/BB/",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/root/Windows/system32/procfile/BB/",
+   "result": "0x10"
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Windows\\system32/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/root/Windows/system32/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "result": "0x80"
+  }
+ ],
+ [
+  "CreateFile",
+  {
+   "win": "C:\\Windows\\system32/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "host": "/home/hatch/workspace/atrac-salwrap-work/unicorn/scratch/root/Windows/system32/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "access": "0xc0000000",
+   "disp": 3,
+   "existed": true,
+   "size": 232,
+   "result": "handle=0x158"
+  }
+ ],
+ [
+  "GetFileSize",
+  {
+   "win": "C:\\Windows\\system32/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "size": 232
+  }
+ ],
+ [
+  "ReadFile",
+  {
+   "win": "C:\\Windows\\system32/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
+   "handle": "0x158",
+   "n": 232,
+   "got": 232,
+   "md5": "21a07d832d170cdc9e61bd3b58b9d34c",
+   "hex": null
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist.dat",
+   "host": "/maclist.dat",
+   "result": "FAIL"
+  }
+ ],
+ [
+  "GetFileAttributes",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist2.dat",
+   "host": "/maclist2.dat",
+   "result": "0x80"
+  }
+ ],
+ [
+  "CreateFile",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist2.dat",
+   "host": "/maclist2.dat",
+   "access": "0x80000000",
+   "disp": 3,
+   "existed": true,
+   "size": 100,
+   "result": "handle=0x15c"
+  }
+ ],
+ [
+  "GetFileSize",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist2.dat",
+   "size": 100
+  }
+ ],
+ [
+  "ReadFile",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist2.dat",
+   "handle": "0x15c",
+   "n": 100,
+   "got": 100,
+   "md5": "d014bf844871efde93875f568a64a61a",
+   "hex": "4d 41 43 4c 49 53 54 00 01 0f 50 00 00 04 00 00 00 00 00 16 72 5f 9b e7 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 04 00 00 00 00 00 00 02 03 00 00 00 10 00 00 00 47 6d a8 aa f8 9c 67 dc e9 98 60 ca 7f 5c 3f ee 04 00 00 00 10 00 00 00 01 02 00 00 00 00 00 00 5a 75 a9 9d c5 47 19 fa"
+  }
+ ],
+ [
+  "fopen",
+  {
+   "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/omglog.txt",
+   "mode": "at",
+   "host": "/omglog.txt",
+   "result": "fp=0x107e76b0"
+  }
+ ],
+ [
+  "WINDOW",
+  {
+   "mark": "vt8-end"
+  }
+ ]
+]
