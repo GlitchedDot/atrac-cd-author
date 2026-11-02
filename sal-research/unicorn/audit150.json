@@ -39,7 +39,7 @@
    "disp": 3,
    "existed": true,
    "size": 232,
-   "result": "handle=0x138"
+   "result": "handle=0x12c"
   }
  ],
  [
@@ -53,7 +53,7 @@
   "ReadFile",
   {
    "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG/procfile/BB/010F500000040000004F7E16725F9BE7B4F37FBB.opf",
-   "handle": "0x138",
+   "handle": "0x12c",
    "n": 232,
    "got": 232,
    "md5": "21a07d832d170cdc9e61bd3b58b9d34c",
@@ -100,25 +100,25 @@
    "access": "0x80000000",
    "disp": 3,
    "existed": true,
-   "size": 21420,
-   "result": "handle=0x13c"
+   "size": 21440,
+   "result": "handle=0x130"
   }
  ],
  [
   "GetFileSize",
   {
    "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist1.dat",
-   "size": 21420
+   "size": 21440
   }
  ],
  [
   "ReadFile",
   {
    "win": "C:\\Program Files (x86)\\Common Files\\Sony Shared\\OpenMG\\maclist1.dat",
-   "handle": "0x13c",
-   "n": 21420,
-   "got": 21420,
-   "md5": "2d026c138138354f596c65716a3808ce",
+   "handle": "0x130",
+   "n": 21440,
+   "got": 21440,
+   "md5": "088b0456b0df4b4eb034733ad728078f",
    "hex": null
   }
  ],

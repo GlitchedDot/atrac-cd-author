@@ -46,25 +46,40 @@ staged Wine prefix, and run logs (summarized in the readouts).
   #18); on an unrestricted machine they are the recipe to retry
   first, against a prefix staged like `host/` describes.
 
-## Current state (2026-10-29)
+## Current state (2026-11-01)
 
 The harness work after readout #20 is recorded in
-`unicorn/SESSION-2026-10-28.md` (sessions through #25, runs to
-165), with the per-run harness evolution kept as the numbered
+`unicorn/SESSION-2026-10-28.md` (sessions through #45, runs to
+259), with the per-run harness evolution kept as the numbered
 `unicorn/sal_emuNN.py` files (sal_emu.py above remains the
 original). Where the frontier stands:
 
-- The SAL script engine (salexec) and the typed-stream driver
-  protocol are decoded; the atpcd "Encrypt" operation has been
-  entered, and the bulk transform sits downstream of a
-  maclist-unwrapped key — but no ciphertext has been produced yet.
-- The install's 20-byte global seed was recovered from
-  maclist1.dat by the harness and validated by Sony's own
-  checker — via a "gates-open" path that a faithful registry
-  model then proved unreachable on a real install: gate #2 is
-  two negative registry probes that fail on genuine hardware,
-  so from a cold start the seed is never surfaced by salwrap.
-- The seed's writer is therefore some component outside
-  salwrap's init. Censuses of omginit.exe and of the SonicStage
-  application layer found no writer; the remaining candidate
-  architectures are logged at the end of the session note.
+- Op 11 is fully lifted (session 35): a keyed MAC built from
+  textbook SHA-1 and FIPS DES, clean-room reimplemented and
+  proven against the live oracle. Its reply is validated by
+  nothing (session 36); d2, the value it depends on, is a
+  constant of the install's ceremony state, so the author may
+  choose its own d2 self-consistently. The header side is
+  closed.
+- The library-path payload cipher is byte-exact (session 37):
+  DES-CBC encrypt with key = d2[0:8] and IV = the header
+  InitVector, continuous chain — proven on all four Ignite
+  tracks. It covers library/.OMA-sourced tracks only.
+- The envelope gate is lifted (session 43): the check value
+  is SHA-1(inner serialization || "ATRAC CD" || a constant
+  16-byte trailer)[0:8], mintable for any inner document.
+- BIND_CONTENT is a record bind, not the audio transform
+  (session 44): its reply rewrites a binding ledger (bytes
+  accumulated, bind count). omgatpcd.dll drives exactly three
+  SAL selectors — key-blob, bind, media-info verify — and none
+  transforms audio.
+- The general (fresh-source) transform is NOT in the held
+  corpus (session 45): 169 unique binaries fingerprinted with
+  zero native cipher tables anywhere (all OpenMG crypto is
+  SAL VM bytecode), and a ~46,000-key construction battery
+  against the non-library tracks found nothing. The missing
+  ingredient is the SAL program/component the real pipeline
+  runs between EA3-encoding a fresh source and the pre-BIND
+  .ATP — from a different SonicStage/OpenMG build than the two
+  held copies, or a component never copied off the machine
+  that burned the reference discs.
