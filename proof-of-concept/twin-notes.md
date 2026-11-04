@@ -1,0 +1,11 @@
+# App test disc build — working notes (incremental)
+- Author read: author.py (TrackInput/build_tree/build_iso), cipher.py (identity placeholder = correct for this class), secure_header.py, atp.py, ndb.py, sti.py, iso.py, id3tag.py, stk.py/stk_data.py.
+- No README file exists in ~/workspace/atrac-cd-author/ working tree (gap noted).
+- build_tree takes rng only for SecureHeader.fresh + Toc.build modeled fields -> will feed a queued RNG returning the reference disc's actual values in call order: block_seed(8), init_vector(8), connum(2), track_slot(4), mgd(8), toc disc_id_a(8), disc_id_b(16).
+- Known author limitation spotted pre-build: SecureHeader.to_bytes hardcodes CONNUM_TAIL=16725f9be7 at header 0x2B..0x2F (disc-1 repository tail). No API to override -> expect a 5-byte divergence in TRK00001.ATP header vs appliance disc (its tail differs). Will verify empirically.
+- Reference parsed: TRACK='Want You Gone', ARTIST='Aperture Science Psychoacousti' (30u clamp), ALBUM='Portal 2 Soundtrack [Songs to' (30u clamp), GROUP = album string, range (1,1). PLLIST empty.
+- TOC ref: total_seconds=143 (author model frames_to_seconds(3094)=143 MATCHES), disc_id_a=a8fb3de83fc4b6b5, disc_id_b=fb23c921c0fce07e3f254e270dabe815.
+- Header ref: block_seed=a2e39b5e80b925a4, IV=5f231f406a2892ee, connum=30fb, track_slot=290e7f21, mgd=757b5fdd1d1129f7. Ref 0x2B..0x2F=4a559ac07a (appliance repository-CID tail) vs author hardcoded 16725f9be7 -> predicted 5-byte ATP divergence at file offsets 1067..1071.
+- Author STK == reference STK byte-identical (pre-check).
+- Ref ISO: 608 sectors on file, PVD volume_space_size=601, PVD stamps 2026110319155017 + tz 0xe0(-8h); root date7 hour=19 (UTC digits in dir records too). Build will use timestamp 2026-11-03T19:15:50.17Z; author writes tz byte 0x00 -> ISO-level stamp bytes will differ in tz byte only (not a file-content issue).
+- Rebuilt with timestamp 2026-11-03T11:15:50.17-08:00 (author model: PVD digits UTC, dir records local) -> all timestamp bytes match the reference except the PVD expiration stamp (genuine burner writes creation+100y; author reuses creation for all four stamps).

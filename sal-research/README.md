@@ -83,3 +83,12 @@ original). Where the frontier stands:
   .ATP — from a different SonicStage/OpenMG build than the two
   held copies, or a component never copied off the machine
   that burned the reference discs.
+
+## 2026-11-03 — BREAKTHROUGH
+
+The format is solved end-to-end. Sessions 56–64 (readouts) lifted the
+ICV fold (S60) and the BlockSeed seal (S63b), proved V universal, and
+exhausted the disc surface (S64); discs 11 and 12 played WITH AUDIO
+on the D-NE1 — disc 12 carrying atracdenc-encoded frames from an
+ordinary MP3. Full account: `project-notes/breakthrough-2026-11-03.md`;
+build scripts and burn notes: `proof-of-concept/`.
