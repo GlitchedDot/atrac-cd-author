@@ -24,11 +24,26 @@ ATRAC CDs without SonicStage.
 - **Capacity: exact, not estimated.** Every byte is budgeted
   (audio + a measured 1,120 bytes per track + paperwork + ISO
   structures); the author refuses to emit an over-capacity image.
-- **Encryption: NOT included.** Payload encryption happens inside
-  Sony's OpenMG secure modules and has not been reproduced yet.
-  `src/atrac_author/cipher.py` is a loudly named placeholder that
-  passes payloads through unencrypted — discs built today are
-  structure tests only and will not play.
+- **Encryption: SOLVED (2026-11-03).** The payload cipher
+  (DES-CBC under the install's content key), the per-track
+  BlockSeed seal (two-key triple-DES over the disc ID, the
+  track's bind index, and the content key), and the TOC
+  integrity value (an unkeyed fold over the track sizes and
+  the disc ID) were all lifted from Sony's OpenMG modules and
+  validated byte-for-byte against genuine discs — see
+  `project-notes/breakthrough-2026-11-03.md` and the session
+  reports under `sal-research/`. The working implementation
+  currently lives in the proof-of-concept build scripts
+  (`proof-of-concept/`); folding it into
+  `src/atrac_author/cipher.py` is the next step.
+- **Proof of concept: playing on real hardware.** App-authored
+  discs were burned and played with audio on a D-NE1: a
+  single-track disc carrying atracdenc-encoded audio with no
+  Sony software anywhere in the chain, and a five-track,
+  two-group disc exercising the full recipe at scale. Both
+  ISOs are attached to the release `poc-disc12-2026-11-03`.
+- **What remains:** the user-facing tools — a web app (Wasm
+  core, ISO out) and a native Mac app sharing this core.
 - **The STK record is not distributed.** `0001000E.STK` is Sony
   EKB data. Supply your own copy from a SonicStage disc you
   burned; `stk_data.py` documents how it is loaded.
@@ -40,6 +55,9 @@ ATRAC CDs without SonicStage.
   `secure_header.py`, `atp.py`, `cipher.py`, `iso.py`,
   `capacity.py`, `author.py` (orchestration: track list in,
   finished ISO out).
+- `proof-of-concept/` — the build scripts and notes for the
+  hardware-proven test discs (the encryption recipe lives here
+  until it is folded into the library).
 - `validate.py` — regenerates both reference discs' paperwork and
   compares byte-for-byte (needs the reference files locally).
 - `build_ladder.py` — builds a nine-bitrate ladder test disc
