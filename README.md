@@ -9,7 +9,7 @@ payload), the `TRACK/ALBUM/ARTIST/GROUP/PLLIST.NDB` databases,
 an ISO 9660 image laid out the way the original burner lays it out.
 
 This is the pipeline core of a larger project: a one-step
-drop-audio-get-a-disc tool (web app and native Mac app) for making
+drop-audio-get-a-disc tool (web app, native Mac app, native Windows app) for making
 ATRAC CDs without SonicStage.
 
 ## Status
@@ -42,8 +42,20 @@ ATRAC CDs without SonicStage.
   Sony software anywhere in the chain, and a five-track,
   two-group disc exercising the full recipe at scale. Both
   ISOs are attached to the release `poc-disc12-2026-11-03`.
-- **What remains:** the user-facing tools — a web app (Wasm
-  core, ISO out) and a native Mac app sharing this core.
+- **Native apps: complete and hardware-proven.** `native-pure/`
+  is the native Mac app (Swift core byte-identical to the
+  reference fixture; AVFoundation decode, bundled atracdenc,
+  ISO, burn) — its full encode-to-playing-disc chain was proven
+  on a D-NE1 on 2026-11-05. `native-win/` is the native Windows
+  app (C# core passing the same byte-parity gate; WinUI 3 face;
+  IMAPI2 burn) — encode, import, burn, and D-NE1 playback all
+  proven on 2026-11-06. Both are ports of this repository's
+  authoring recipe, with their designs and build notes in-tree.
+- **What remains:** folding the encryption recipe into
+  `src/atrac_author/cipher.py` (see above), packaging polish
+  for the native apps, and the public release of the
+  user-facing tool (DiscWright), whose web version will be
+  supply-your-own-STK like this repository.
 - **The STK record is not distributed.** `0001000E.STK` is Sony
   EKB data. Supply your own copy from a SonicStage disc you
   burned; `stk_data.py` documents how it is loaded.
