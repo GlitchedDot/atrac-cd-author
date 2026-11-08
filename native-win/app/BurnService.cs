@@ -30,10 +30,13 @@ namespace DiscWright;
 public static class BurnService
 {
     /// <summary>offerBurn(iso, source): "Burn this disc now?" —
-    /// the Mac wording, verbatim. Reports BurnState.Started
-    /// while IMAPI2 writes and BurnState.Finished with the
-    /// outcome, and logs the burn's own messages through `log`
-    /// (the drutil-output equivalent).</summary>
+    /// the Mac wording, verbatim, in two origins (v32): a disc
+    /// the app itself just encoded says it is "encoded and
+    /// ready"; a genuinely imported ISO says it is "imported".
+    /// Reports BurnState.Started while IMAPI2 writes and
+    /// BurnState.Finished with the outcome, and logs the burn's
+    /// own messages through `log` (the drutil-output
+    /// equivalent).</summary>
     public static async Task OfferBurnAsync(
         Window window,
         ImportedDisc disc,
@@ -43,8 +46,9 @@ public static class BurnService
         var dialog = new ContentDialog
         {
             Title = "Burn this disc now?",
-            Content = $"“{disc.Name}” — You imported this ISO. " +
-                      "Put a blank CD in the drive, then burn it.",
+            Content = disc.FromEncode
+                ? $"“{disc.Name}” — Your disc is encoded and ready. Put a blank CD in the drive, then burn it."
+                : $"“{disc.Name}” — You imported this ISO. Put a blank CD in the drive, then burn it.",
             PrimaryButtonText = "Burn Disc",
             CloseButtonText = "Not Now",
             DefaultButton = ContentDialogButton.Primary,

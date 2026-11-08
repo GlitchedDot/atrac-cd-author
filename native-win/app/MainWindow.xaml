@@ -290,23 +290,26 @@
                                         Visibility="{Binding HasImported, Converter={StaticResource BoolToVis}}"
                                         VerticalAlignment="Center"/>
                             </StackPanel>
-                            <!-- Step 3 (v26): Make ISO — Lola's test
-                                 path for the encoder: encode the list
-                                 to Downloads\atrac-disc.iso, which she
-                                 imports straight back for the proven
-                                 burn. Every IsEnabled below sits on
+                            <!-- Final version (v32): Burn Disc runs
+                                 the whole job now — encode, author,
+                                 and the burn offer in one go (the
+                                 encode's ISO still lands in
+                                 Downloads). This row keeps the
+                                 encode's Cancel and the workers
+                                 picker. The Make ISO button that
+                                 lived here was Lola's temporary
+                                 encoder test path (v26–v31) and is
+                                 removed in the final version at her
+                                 word. Every IsEnabled below sits on
                                  the Control itself, NEVER on a panel
                                  (see the blank-picker note above).
                                  Workers bounds/value are set in
                                  code-behind (they depend on the
                                  machine's core count). -->
                             <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,8,0,0">
-                                <Button x:Name="MakeIsoButton" Content="Make ISO" Click="MakeIso_Click"
-                                        IsEnabled="{Binding CanMakeIso}"
-                                        Background="{StaticResource SsBlue2Brush}" Foreground="White"
-                                        FontSize="14" FontWeight="Bold" Padding="14,7"/>
                                 <Button Content="Cancel" Click="CancelEncode_Click"
                                         IsEnabled="{Binding IsEncoding}"
+                                        FontSize="14" Padding="14,7"
                                         VerticalAlignment="Center"/>
                                 <!-- The workers selector is a ComboBox,
                                      NOT a NumberBox: the NumberBox killed
@@ -322,7 +325,7 @@
                                           SelectionChanged="WorkersCombo_SelectionChanged"
                                           VerticalAlignment="Center"/>
                             </StackPanel>
-                            <TextBlock Text="Make ISO works now — encode a new disc to Downloads\atrac-disc.iso and import it to burn; burn-after-encode arrives next."
+                            <TextBlock Text="Burn Disc encodes a new disc, authors its ISO to Downloads, then offers the burn."
                                        FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0"
                                        Foreground="{ThemeResource SmallTextBrush}"
                                        Visibility="{Binding HasImported, Converter={StaticResource InvBoolToVis}}"/>

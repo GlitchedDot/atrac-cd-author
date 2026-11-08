@@ -1,6 +1,6 @@
 @echo off
 setlocal
-rem DiscWright Windows app - Step 3 build (v28).
+rem DiscWright Windows app - Final build (v36).
 rem
 rem Usage (cmd or PowerShell, from anywhere):
 rem   build-app.cmd
@@ -8,7 +8,12 @@ rem Prepares the encoder tools (tools\ - see the tools stage
 rem below), builds the WinUI 3 app with Visual Studio's MSBuild
 rem (Release, x64, unpackaged + self-contained), and copies
 rem the runnable output plus the tools into DiscWright\ next
-rem to this script.
+rem to this script. After the folder, the script ALSO
+rem produces DiscWright-standalone.exe next to this script -
+rem one file, double-click to run, no install (it unpacks
+rem itself under %LOCALAPPDATA%\DiscWright on first run; see
+rem launcher\launcher.cpp). The folder build stays for
+rem debugging.
 rem Run it by double-clicking DiscWright\DiscWright.exe - the
 rem folder carries its own Windows App SDK + .NET runtime.
 rem Every path is quoted: build folders may contain spaces.
@@ -312,17 +317,145 @@ copy /y "%TOOLS%\atracdenc.exe" "%ROOT%DiscWright\tools\" >nul
 copy /y "%TOOLS%\*.dll" "%ROOT%DiscWright\tools\" >nul
 if not exist "%ROOT%DiscWright\tools\ffmpeg.exe" (
     echo Build reported success but tools\ffmpeg.exe is missing from the output.
-    echo Do not ship this build - Make ISO would have no decoder.
+    echo Do not ship this build - the encoder would have no decoder.
     exit /b 1
 )
 if not exist "%ROOT%DiscWright\tools\atracdenc.exe" (
     echo Build reported success but tools\atracdenc.exe is missing from the output.
-    echo Do not ship this build - Make ISO would have no encoder.
+    echo Do not ship this build - the encoder would have no encoder tool.
     exit /b 1
 )
+
+rem ============================================================
+rem Standalone stage (v32; hardened in v34): pack the
+rem DiscWright\ folder into ONE double-clickable file -
+rem DiscWright-standalone.exe = [launcher PE][payload.zip]
+rem [48-byte footer]. The launcher (launcher\launcher.cpp)
+rem unpacks the folder per-user under %LOCALAPPDATA%\DiscWright
+rem on first run and starts the app: no install, no admin.
+rem WinUI 3 has no true single-file publishing, so this
+rem bootstrapper is the single-file form.
+rem
+rem v34: the launcher is hardened so a standalone that does
+rem not run TESTIFIES instead of dying silently (which is
+rem what v32's did on Lola's machine): named-stage errors
+rem S1-S11 with Win32 codes, a payload self-check against
+rem the footer, unpack.log in the unpack folder, and a
+rem watch console narrating the first run live. This stage
+rem testifies too: every exit below sets STANDALONE_FAIL,
+rem and the final summary prints a STANDALONE RESULT verdict
+rem (OK, or SKIPPED - <stage>) that cannot scroll by unnoticed.
+rem
+rem The standalone is an EXTRA, never a gate: a machine
+rem without the MSVC C++ toolset still produces the proven
+rem folder build, and this stage just warns and skips.
+rem ============================================================
+set "STANDALONE_OK=0"
+set "STANDALONE_FAIL="
+set "STAMP=2026-11-07.v36"
+set "VCVARS="
+if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS (
+    set "STANDALONE_FAIL=toolset"
+    echo.
+    echo WARNING: no Visual Studio C++ toolset ^(vcvars64.bat^) was found, so
+    echo the standalone exe was SKIPPED. The folder build below is complete.
+    echo To get the standalone too, add the "C++ WinUI app development
+    echo tools" ^(or any C++ workload^) in the Visual Studio Installer.
+    goto StandaloneDone
+)
+call "%VCVARS%" >nul
+if exist "%TEMP%\discwright-launcher.exe" del /q "%TEMP%\discwright-launcher.exe"
+if exist "%TEMP%\discwright-launcher.obj" del /q "%TEMP%\discwright-launcher.obj"
+"%SystemRoot%\System32\where.exe" cl >nul 2>&1
+if errorlevel 1 (
+    set "STANDALONE_FAIL=cl"
+    echo.
+    echo WARNING: cl.exe is not available after vcvars64 - the standalone
+    echo exe was SKIPPED. The folder build below is complete.
+    goto StandaloneDone
+)
+if exist "%ROOT%standalone-build.log" del /q "%ROOT%standalone-build.log"
+cl /nologo /O2 /W3 /DUNICODE /D_UNICODE "%ROOT%launcher\launcher.cpp" /Fe:"%TEMP%\discwright-launcher.exe" /Fo:"%TEMP%\discwright-launcher.obj" /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib ole32.lib > "%ROOT%standalone-build.log" 2>&1
+if errorlevel 1 (
+    set "STANDALONE_FAIL=compile"
+    echo.
+    echo WARNING: compiling the standalone launcher FAILED - the
+    echo compiler said:
+    type "%ROOT%standalone-build.log"
+    echo The standalone exe was SKIPPED. The folder build below is
+    echo complete, and the full compiler output is saved as
+    echo standalone-build.log beside this script.
+    goto StandaloneDone
+)
+if exist "%TEMP%\discwright-payload.zip" del /q "%TEMP%\discwright-payload.zip"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%ROOT%DiscWright\*' -DestinationPath '%TEMP%\discwright-payload.zip' -Force"
+if errorlevel 1 (
+    set "STANDALONE_FAIL=pack"
+    echo.
+    echo WARNING: packing the standalone payload FAILED - the standalone
+    echo exe was SKIPPED. The folder build below is complete.
+    goto StandaloneDone
+)
+if not exist "%TEMP%\discwright-payload.zip" (
+    set "STANDALONE_FAIL=pack"
+    echo.
+    echo WARNING: the payload zip was not produced - the standalone exe
+    echo was SKIPPED. The folder build below is complete.
+    goto StandaloneDone
+)
+rem The 48-byte footer: magic "DWPAYLD1", the payload length
+rem as a little-endian uint64, then the build stamp padded
+rem with NUL bytes to 32 - the layout launcher.cpp reads.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$len = (Get-Item '%TEMP%\discwright-payload.zip').Length; $footer = New-Object byte[] 48; [System.Text.Encoding]::ASCII.GetBytes('DWPAYLD1').CopyTo($footer, 0); [System.BitConverter]::GetBytes([uint64]$len).CopyTo($footer, 8); [System.Text.Encoding]::ASCII.GetBytes('%STAMP%').CopyTo($footer, 16); [System.IO.File]::WriteAllBytes('%TEMP%\discwright-footer.bin', $footer)"
+if errorlevel 1 (
+    set "STANDALONE_FAIL=footer"
+    echo.
+    echo WARNING: writing the standalone footer FAILED - the standalone
+    echo exe was SKIPPED. The folder build below is complete.
+    goto StandaloneDone
+)
+if exist "%ROOT%DiscWright-standalone.exe" del /q "%ROOT%DiscWright-standalone.exe"
+copy /b "%TEMP%\discwright-launcher.exe" + "%TEMP%\discwright-payload.zip" + "%TEMP%\discwright-footer.bin" "%ROOT%DiscWright-standalone.exe" >nul
+if errorlevel 1 (
+    set "STANDALONE_FAIL=assemble"
+    echo.
+    echo WARNING: assembling the standalone exe FAILED - the standalone
+    echo exe was SKIPPED. The folder build below is complete.
+    goto StandaloneDone
+)
+if not exist "%ROOT%DiscWright-standalone.exe" (
+    set "STANDALONE_FAIL=assemble"
+    echo.
+    echo WARNING: the standalone exe was not produced - SKIPPED.
+    echo The folder build below is complete.
+    goto StandaloneDone
+)
+rem Verify the assembly the cheap way: its size must exceed
+rem launcher + payload (the 48-byte footer rides on top).
+set "SZ_LAUNCHER=0"
+set "SZ_PAYLOAD=0"
+set "SZ_FINAL=0"
+for %%F in ("%TEMP%\discwright-launcher.exe") do set "SZ_LAUNCHER=%%~zF"
+for %%F in ("%TEMP%\discwright-payload.zip") do set "SZ_PAYLOAD=%%~zF"
+for %%F in ("%ROOT%DiscWright-standalone.exe") do set "SZ_FINAL=%%~zF"
+echo STANDALONE RESULT: OK
+echo Standalone pieces: launcher %SZ_LAUNCHER% bytes + payload %SZ_PAYLOAD% bytes + 48-byte footer = %SZ_FINAL% bytes total.
+set "STANDALONE_OK=1"
+del /q "%TEMP%\discwright-launcher.exe" 2>nul
+del /q "%TEMP%\discwright-launcher.obj" 2>nul
+del /q "%TEMP%\discwright-payload.zip" 2>nul
+del /q "%TEMP%\discwright-footer.bin" 2>nul
+:StandaloneDone
 
 echo.
 echo BUILD SUCCEEDED.
 echo Run: "%ROOT%DiscWright\DiscWright.exe"
 echo Encoder tools are in "%ROOT%DiscWright\tools".
+if "%STANDALONE_OK%"=="1" echo Standalone: "%ROOT%DiscWright-standalone.exe" ^(single file - double-click to run; first run unpacks itself, no install^).
+if "%STANDALONE_OK%"=="1" echo STANDALONE RESULT: OK
+if not "%STANDALONE_OK%"=="1" echo STANDALONE RESULT: SKIPPED - %STANDALONE_FAIL%
 exit /b 0

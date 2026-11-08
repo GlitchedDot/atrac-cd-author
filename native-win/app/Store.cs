@@ -2,7 +2,7 @@
 // of DiscStore.swift. Step 2 brought the list half; Step 3
 // (v26) adds the encode half: the workers setting, the encode
 // state the stage reads (IsEncoding / EncodeProgress), and the
-// Make ISO lifecycle callbacks MainWindow reports through —
+// encode lifecycle callbacks MainWindow reports through —
 // mirroring the Swift store's startEncodeAndBuild state flow,
 // with the orchestration itself in MainWindow + EncodeService.
 // Mirrored semantics:
@@ -38,6 +38,10 @@ public sealed class ImportedDisc
     public string Name = "";
     public long Size;
     public string FilePath = "";
+    /// <summary>Set when this "imported" disc is one the app
+    /// itself just encoded (Burn Disc's offer then uses the
+    /// "encoded and ready" wording, not "you imported").</summary>
+    public bool FromEncode;
 }
 
 /// <summary>The burn's lifecycle, reported to the store: the
@@ -87,13 +91,7 @@ public sealed class DiscStore : ObservableBase
         // group as it is added.
         Groups.Add(new GroupItem("Group 1"));
         Log("Ready.");
-        // The launch line, kept truthful per step: Burn Disc
-        // still serves imported ISOs only, but a new disc can
-        // now be encoded to an ISO (v26's Make ISO) and that
-        // ISO imported straight back for the proven burn.
-        Log("Make ISO is here: encode a new disc to Downloads\\atrac-disc.iso, " +
-            "then import it to burn. Burn-after-encode arrives next; " +
-            "Import ISO + burn works now.");
+        Log("Add tracks, then Burn Disc — a new disc encodes, authors, and offers its burn in one go. Import ISO + burn works too.");
         Refresh();
     }
 
@@ -135,8 +133,8 @@ public sealed class DiscStore : ObservableBase
         private set => SetProperty(ref _stageStatus, value);
     }
 
-    /// <summary>True while a Make ISO encode runs (drives the
-    /// Cancel button's enable and locks Make ISO).</summary>
+    /// <summary>True while a Burn Disc encode runs (drives
+    /// the Cancel button's enable and locks Burn Disc).</summary>
     public bool IsEncoding
     {
         get => _isEncoding;
@@ -301,16 +299,13 @@ public sealed class DiscStore : ObservableBase
         }
     }
 
-    /// <summary>Step 2 burn rule (Mac Step 2 precedent): Burn
-    /// Disc serves an imported ISO only — a new list's button
-    /// stays disabled rather than faking an encode.</summary>
-    public bool BurnEnabled => Imported != null && !IsBurning;
-
-    /// <summary>Make ISO's rule (Step 3): a new list — not an
-    /// imported disc — with at least one track, and nothing
-    /// already burning or encoding.</summary>
-    public bool CanMakeIso =>
-        Imported == null && !IsBurning && !IsEncoding && AllTracks.Count > 0;
+    /// <summary>The final Burn Disc rule: with an imported
+    /// (or just-encoded) ISO it burns straight away; with a
+    /// new list it runs the encode first, then offers the
+    /// burn. Never while encoding or burning.</summary>
+    public bool BurnEnabled =>
+        !IsEncoding && !IsBurning &&
+        (Imported != null || AllTracks.Count > 0);
 
     public bool HasImported => Imported != null;
 
@@ -345,7 +340,6 @@ public sealed class DiscStore : ObservableBase
         OnPropertyChanged(nameof(CapacityFraction));
         OnPropertyChanged(nameof(CapacityOver));
         OnPropertyChanged(nameof(BurnEnabled));
-        OnPropertyChanged(nameof(CanMakeIso));
         OnPropertyChanged(nameof(HasImported));
         OnPropertyChanged(nameof(IntakeEnabled));
         OnPropertyChanged(nameof(LibInfoText));
@@ -515,7 +509,7 @@ public sealed class DiscStore : ObservableBase
 
     // ---- import ISO ----
 
-    public void ImportIso(string path)
+    public void ImportIso(string path, bool fromEncode = false)
     {
         try
         {
@@ -547,6 +541,7 @@ public sealed class DiscStore : ObservableBase
                 Name = Path.GetFileName(path),
                 Size = data.Length,
                 FilePath = path,
+                FromEncode = fromEncode,
             };
             Log($"Imported “{Path.GetFileName(path)}”: {disc.TrackCount} " +
                 $"track{(disc.TrackCount == 1 ? "" : "s")} in {disc.Groups.Count} " +
@@ -595,8 +590,8 @@ public sealed class DiscStore : ObservableBase
         Refresh();
     }
 
-    // ---- encode (Step 3; driven by MainWindow, whose Make
-    // ISO click snapshots the jobs and runs EncodeService +
+    // ---- encode (Step 3; driven by MainWindow, whose Burn
+    // Disc click snapshots the jobs and runs EncodeService +
     // DiscAuthor.BuildDisc off the UI thread, reporting back
     // through these methods on the UI thread — the counterpart
     // of the Swift store's startEncodeAndBuild state flow) ----
@@ -641,8 +636,10 @@ public sealed class DiscStore : ObservableBase
     /// <summary>The ISO is written. The built line carries the
     /// full path and size (the Mac's "Built …" log line), and
     /// the stage lands on the same ready text a finished burn
-    /// uses — for v26 the ISO is then imported back for the
-    /// burn, which stays a separate, proven step.</summary>
+    /// uses — the window then auto-imports the ISO it just
+    /// built (marked FromEncode) and offers its burn, the
+    /// proven Import ISO path, with no Downloads detour by
+    /// hand.</summary>
     public void ApplyEncodeSuccess(EncodeHandle handle, string builtLine)
     {
         if (!ReferenceEquals(_encodeHandle, handle)) return;

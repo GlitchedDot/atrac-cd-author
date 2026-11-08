@@ -28,6 +28,15 @@
          which finds the PRI/AppX tasks in its own folders. -->
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <SelfContained>true</SelfContained>
+    <!-- v33: the native single-file variant's extra properties,
+         switched on ONLY by build-singlefile.cmd passing
+         /p:DiscWrightSingleFile=true — v32's folder build
+         never sees them. Microsoft's WindowsAppSDKSingleFile
+         configuration (WASDK >= 1.5) requires all three for
+         an unpackaged self-contained app. -->
+    <EnableMsixTooling Condition="'$(DiscWrightSingleFile)' == 'true'">true</EnableMsixTooling>
+    <IncludeAllContentForSelfExtract Condition="'$(DiscWrightSingleFile)' == 'true'">true</IncludeAllContentForSelfExtract>
+    <PublishSingleFile Condition="'$(DiscWrightSingleFile)' == 'true'">true</PublishSingleFile>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- The PRI/AppX MSBuild tasks (Microsoft.Build.Packaging.Pri.Tasks.dll)
@@ -59,6 +68,27 @@
     <Content Include="DiscWright.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+  </ItemGroup>
+
+  <!-- v33: the encoder tools as project content — ONLY for
+       the single-file publish. Today they are not project
+       content at all: build scripts copy them beside the
+       exe after the build, so a single-file bundle would
+       silently omit them and every encode would fail
+       "ffmpeg was not found". Linked into a tools\ folder
+       in the output (EncodeService looks for
+       <base>\tools\ffmpeg.exe / atracdenc.exe, sndfile.dll
+       rides beside atracdenc). ExcludedFromSingleFile keeps
+       them as loose content files that the self-extract
+       carries, instead of embedding them inside the main
+       assembly. The files exist by the time MSBuild runs:
+       the build scripts' tools stage prepares
+       native-win\tools\ first. The folder build never sets
+       DiscWrightSingleFile, so it never sees these items. -->
+  <ItemGroup Condition="'$(DiscWrightSingleFile)' == 'true'">
+    <Content Include="..\tools\ffmpeg.exe"><Link>tools\ffmpeg.exe</Link><CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory><CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory><ExcludeFromSingleFile>true</ExcludeFromSingleFile></Content>
+    <Content Include="..\tools\atracdenc.exe"><Link>tools\atracdenc.exe</Link><CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory><CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory><ExcludeFromSingleFile>true</ExcludeFromSingleFile></Content>
+    <Content Include="..\tools\sndfile.dll"><Link>tools\sndfile.dll</Link><CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory><CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory><ExcludeFromSingleFile>true</ExcludeFromSingleFile></Content>
   </ItemGroup>
 
 </Project>

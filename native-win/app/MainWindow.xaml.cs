@@ -164,24 +164,34 @@ public sealed partial class MainWindow : Window
     private void ClearImport_Click(object sender, RoutedEventArgs e) =>
         Store.ClearImport();
 
-    // ---- burn (imported ISO; the dialog needs this window) ----
+    // ---- burn (the dialog needs this window) ----
 
     private async void BurnDisc_Click(object sender, RoutedEventArgs e)
     {
-        if (Store.Imported is not { } imp) return;
-        await BurnService.OfferBurnAsync(
-            this, imp,
-            (state, success) => Store.ApplyBurnState(state, success),
-            Store.Log);
+        if (Store.Imported is { } imp)
+        {
+            await BurnService.OfferBurnAsync(
+                this, imp,
+                (state, success) => Store.ApplyBurnState(state, success),
+                Store.Log);
+            return;
+        }
+        await BurnNewDiscAsync();
     }
 
-    // ---- encode (Step 3: Make ISO) ----
-    // Lola's test path for the encoder: encode the new list to
-    // Downloads\atrac-disc.iso (no physical disc spent), which
-    // she then imports straight back for the proven burn. The
-    // orchestration mirrors the Mac store's startEncodeAndBuild;
-    // the state flow reports through the store, BurnService-
-    // style, via the DispatcherQueue.
+    // ---- encode (Step 3; driven by Burn Disc in the final
+    // version) ----
+    // Burn Disc on a new list: encode + author it (the ISO
+    // still lands in Downloads\atrac-disc.iso, no physical
+    // disc spent up front), then the window hands the fresh
+    // ISO to the same proven Import ISO + OfferBurn path —
+    // auto-imported and marked FromEncode, so the burn offer
+    // follows the encode in one go. (v26–v31 surfaced this
+    // through a temporary Make ISO button, Lola's test path;
+    // removed in v32 at her word.) The orchestration mirrors
+    // the Mac store's startEncodeAndBuild; the state flow
+    // reports through the store, BurnService-style, via the
+    // DispatcherQueue.
 
     private void WorkersCombo_SelectionChanged(
         object sender, SelectionChangedEventArgs e)
@@ -193,7 +203,7 @@ public sealed partial class MainWindow : Window
     private void CancelEncode_Click(object sender, RoutedEventArgs e) =>
         Store.CancelEncode();
 
-    private void MakeIso_Click(object sender, RoutedEventArgs e)
+    private async Task BurnNewDiscAsync()
     {
         // Pre-flight, the Mac's build guards: refuse loudly
         // rather than author a disc with a hole in it.
@@ -261,6 +271,11 @@ public sealed partial class MainWindow : Window
 
         var queue = DispatcherQueue;
         void Enqueue(Action action) => queue.TryEnqueue(() => action());
+        // The success hop is async (it ends in the burn
+        // offer), so it gets its own enqueue.
+        void EnqueueAsync(Func<Task> action) =>
+            queue.TryEnqueue(async () => await action());
+        string isoPath = "";
 
         // Encode + author + write run off the UI thread; every
         // store touch hops back through the DispatcherQueue,
@@ -309,13 +324,23 @@ public sealed partial class MainWindow : Window
                         Environment.SpecialFolder.UserProfile),
                     "Downloads");
                 Directory.CreateDirectory(downloads);
-                string isoPath = Path.Combine(downloads, "atrac-disc.iso");
+                isoPath = Path.Combine(downloads, "atrac-disc.iso");
                 File.WriteAllBytes(isoPath, result.Iso);
                 string line =
                     $"Built {isoPath} — {result.Stats.TrackCount} tracks, " +
                     $"{Format.MbString(result.Iso.Length)} MB, " +
                     $"{result.Stats.IsoSectors} sectors.";
-                Enqueue(() => Store.ApplyEncodeSuccess(handle, line));
+                EnqueueAsync(async () =>
+                {
+                    Store.ApplyEncodeSuccess(handle, line);
+                    Store.ImportIso(isoPath, fromEncode: true);
+                    if (Store.Imported is { } imp2)
+                        await BurnService.OfferBurnAsync(
+                            this, imp2,
+                            (state, success) =>
+                                Store.ApplyBurnState(state, success),
+                            Store.Log);
+                });
             }
             catch (EncodeException ex)
                 when (ex.Kind == EncodeFailureKind.Cancelled)
