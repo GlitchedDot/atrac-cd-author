@@ -54,9 +54,18 @@ public sealed partial class MainWindow : Window
         }
         catch { /* the default icon is a shrug, not a stop */ }
 
-        // The Mac window's default size (1180x820 there; a bit
-        // taller here for the WinUI control chrome).
-        AppWindow.Resize(new SizeInt32(1200, 880));
+        // Default size. v37 (Lola, 2026-11-07): the right
+        // column's fixed stack — header, disc stage, status,
+        // blank picker, capacity meter, action rows — adds up
+        // taller than 880, and the layout quietly clipped the
+        // bottom rows, which are exactly the encode's Cancel
+        // button and the workers picker. She wants them
+        // visible, always: 980 tall here, and the disc stage
+        // gives back height on its side (440 -> 336 in the
+        // XAML; the painter sizes the disc from the canvas it
+        // is given). Together ~200 DIP of headroom, so the
+        // whole column fits at the default size.
+        AppWindow.Resize(new SizeInt32(1200, 980));
 
         RootGrid.DataContext = Store;
         ((CollectionViewSource)RootGrid.Resources["GroupsSource"]).Source =
