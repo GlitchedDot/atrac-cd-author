@@ -14,8 +14,15 @@
 //     and 105/111 of R, with the web's flicker (0.88–1.0,
 //     re-rolled in ~160 ms buckets),
 //   - hub disc + "ATRAC CD" label in Comic Sans MS.
-// Spin speeds: idle 80 deg/s, burning 200 deg/s (the restyle
-// rule "idle spin is slower"). The laser's fraction f: since
+// Spin speeds: idle 80 deg/s only. While the stage is in its
+// burning state (which covers BOTH the encode and the burn —
+// the store raises IsBurning for the whole job, Step 3) the
+// disc does NOT spin at all: Lola's rule (2026-11-07, v38) —
+// a still disc is what lets people watch the laser spot travel
+// outward as the work progresses. Before v38 the burning state
+// spun at 200 deg/s and the laser strobed around the flip.
+// The sheen keeps rotating while burning (it is light, not
+// the disc turning). The laser's fraction f: since
 // Step 3 (v26) the encode feeds it for real through the
 // store's EncodeProgress; an imported ISO's burn (IMAPI2
 // reports no progress) still paces it cosmetically — a full
@@ -56,7 +63,9 @@ namespace DiscWright;
 public sealed class DiscPainter
 {
     private const double IdleSpinSpeed = 80.0;  // web SPIN_DEG_PER_SEC
-    private const double BurnSpinSpeed = 200.0;
+    // No burn spin speed since v38: the disc holds still while
+    // encoding/writing so the laser's travel stays readable
+    // (Lola, 2026-11-07).
     private const double SheenSpeed = 150.0;    // web burnStep sheen rate
     private const double SquashY = 0.94;        // web tilt squash target
     private const double LaserAngleDeg = 90.0;  // Bottom (saved default)
@@ -92,7 +101,15 @@ public sealed class DiscPainter
         _wasBurning = burning;
         if (!ReduceMotion)
         {
-            _spinDeg = (_spinDeg + (burning ? BurnSpinSpeed : IdleSpinSpeed) * dt) % 360;
+            // v38: while the stage is working (encode or burn —
+            // IsBurning covers both), _spinDeg is NOT advanced:
+            // the disc freezes at whatever angle it had, front
+            // face settling out of the squash on its own as Draw
+            // keeps using the frozen angle, and the laser spot
+            // travels across a still disc. Idle spin resumes
+            // when the job ends.
+            if (!burning)
+                _spinDeg = (_spinDeg + IdleSpinSpeed * dt) % 360;
             if (burning) _sheenDeg = (_sheenDeg + SheenSpeed * dt) % 360;
         }
     }
@@ -107,7 +124,15 @@ public sealed class DiscPainter
         double r = w / 2 - 8;
         if (r <= 10) return;
         double cx = w / 2;
-        double cy = r + 14;
+        // v38: the disc's center sits lower than the original
+        // port (r + 14) — Lola could see the shadow ellipse at
+        // 1.348 R below center running off the stage's bottom
+        // edge ("the area below the disc is cut off"). The
+        // stage canvas grew to 384 tall in the XAML for the
+        // same reason; cy = r + 56 leaves the shadow's full
+        // falloff (bottom ≈ cy + 1.348R + 0.1055R ≈ 385 at the
+        // pane's width) inside the stage.
+        double cy = r + 56;
         double c = Math.Cos(spinDeg * Math.PI / 180);
         double a = Math.Abs(c);
         bool back = c < 0;

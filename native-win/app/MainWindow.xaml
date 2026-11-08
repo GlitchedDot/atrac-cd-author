@@ -226,15 +226,17 @@
                                        HorizontalAlignment="Right" VerticalAlignment="Center"/>
                         </Grid>
 
-                        <!-- the disc stage (Win2D). Height 336
-                             since v37: at 440 the right column's
-                             stack outgrew the window and the
-                             bottom action rows (Cancel, Encode
-                             workers) were clipped at the default
-                             size — Lola wants them visible. The
-                             painter sizes the disc from the canvas
-                             bounds, so the disc stays round. -->
-                        <canvas:CanvasControl x:Name="DiscCanvas" Grid.Row="1" Height="336"
+                        <!-- the disc stage (Win2D). Height 384
+                             (v38): 440 in v36 and earlier let the
+                             right column outgrow the 880 window
+                             and clip the bottom action rows; v37
+                             overcorrected to 336, and the disc's
+                             ground shadow (painted 1.348 R below
+                             center) ran off the stage's bottom
+                             edge. 384 + the painter's lower disc
+                             placement fits the shadow AND the
+                             rows, inside the v37 window (980). -->
+                        <canvas:CanvasControl x:Name="DiscCanvas" Grid.Row="1" Height="384"
                                               ClearColor="Transparent"
                                               Draw="DiscCanvas_Draw"/>
                         <TextBlock Grid.Row="2" Text="{Binding StageStatus}"
