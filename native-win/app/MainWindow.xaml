@@ -226,22 +226,24 @@
                                        HorizontalAlignment="Right" VerticalAlignment="Center"/>
                         </Grid>
 
-                        <!-- the disc stage (Win2D). Height 384
-                             (v38): 440 in v36 and earlier let the
-                             right column outgrow the 880 window
-                             and clip the bottom action rows; v37
-                             overcorrected to 336, and the disc's
-                             ground shadow (painted 1.348 R below
-                             center) ran off the stage's bottom
-                             edge. 384 + the painter's lower disc
-                             placement fits the shadow AND the
-                             rows, inside the v37 window (980). -->
-                        <canvas:CanvasControl x:Name="DiscCanvas" Grid.Row="1" Height="384"
+                        <!-- the disc stage (Win2D). Height 416
+                             (v39): the painted artwork — disc
+                             plus its ground shadow — spans about
+                             2.5x the disc's radius, which never
+                             fit ANY earlier stage height (440,
+                             336, 384 all clipped the bottom).
+                             The painter now caps the radius at
+                             160 and centers the whole span in
+                             this stage, with clear air above the
+                             status line below. The window stays
+                             at v37's 980; the buttons keep their
+                             room. -->
+                        <canvas:CanvasControl x:Name="DiscCanvas" Grid.Row="1" Height="416"
                                               ClearColor="Transparent"
                                               Draw="DiscCanvas_Draw"/>
                         <TextBlock Grid.Row="2" Text="{Binding StageStatus}"
                                    Foreground="{ThemeResource StageStatusBrush}"
-                                   FontWeight="Bold" FontSize="13"
+                                   FontWeight="Bold" FontSize="13" Margin="0,6,0,0"
                                    TextAlignment="Center" TextWrapping="Wrap"/>
 
                         <Rectangle Grid.Row="3" Height="1" Margin="0,8"

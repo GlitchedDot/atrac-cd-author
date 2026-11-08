@@ -121,18 +121,24 @@ public sealed class DiscPainter
         double sheenDeg = ReduceMotion ? 0 : _sheenDeg;
 
         float w = (float)size.Width;
-        double r = w / 2 - 8;
+        // v39: the WHOLE artwork has to fit the stage, and it
+        // is much taller than the disc: rim top at
+        // cy - 0.94R - bob, shadow bottom at cy + 1.4535R —
+        // a span of ~2.5 R. Sized from the pane's width alone
+        // (R = 182) that span is ~455, taller than EVERY stage
+        // height this app has shipped (440, 336, 384), so the
+        // disc's bottom and shadow were clipped in all of
+        // them and the status text below the stage clipped
+        // into the disc (Lola, v36-v38, finally called in
+        // v39). The radius is now capped at 160 and the center
+        // is placed to center the whole span in the stage's
+        // height: at R = 160 in the 416-tall stage the rim
+        // clears the top by ~12 and the shadow completes ~12
+        // above the bottom edge. Nothing paints outside.
+        double r = Math.Min(w / 2 - 8, 160);
         if (r <= 10) return;
         double cx = w / 2;
-        // v38: the disc's center sits lower than the original
-        // port (r + 14) — Lola could see the shadow ellipse at
-        // 1.348 R below center running off the stage's bottom
-        // edge ("the area below the disc is cut off"). The
-        // stage canvas grew to 384 tall in the XAML for the
-        // same reason; cy = r + 56 leaves the shadow's full
-        // falloff (bottom ≈ cy + 1.348R + 0.1055R ≈ 385 at the
-        // pane's width) inside the stage.
-        double cy = r + 56;
+        double cy = size.Height / 2 - 0.2304 * r;
         double c = Math.Cos(spinDeg * Math.PI / 180);
         double a = Math.Abs(c);
         bool back = c < 0;

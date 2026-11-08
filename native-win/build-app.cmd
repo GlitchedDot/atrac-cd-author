@@ -1,6 +1,6 @@
 @echo off
 setlocal
-rem DiscWright Windows app - Final build (v38).
+rem DiscWright Windows app - Final build (v39).
 rem
 rem Usage (cmd or PowerShell, from anywhere):
 rem   build-app.cmd
@@ -352,7 +352,7 @@ rem folder build, and this stage just warns and skips.
 rem ============================================================
 set "STANDALONE_OK=0"
 set "STANDALONE_FAIL="
-set "STAMP=2026-11-07.v38"
+set "STAMP=2026-11-07.v39"
 set "VCVARS="
 if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
